@@ -1,0 +1,21 @@
+{
+  "name": "claude-grok-plugin",
+  "owner": {
+    "name": "faeton"
+  },
+  "metadata": {
+    "description": "Marketplace for the Grok consultation plugin for Claude Code.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "grok",
+      "description": "Consult xAI's Grok CLI from Claude Code for a strictly read-only second opinion or code review.",
+      "version": "0.2.0",
+      "author": {
+        "name": "faeton"
+      },
+      "source": "./plugins/grok"
+    }
+  ]
+}

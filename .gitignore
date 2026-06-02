@@ -1,0 +1,6 @@
+node_modules/
+*.log
+*.jsonl
+*.tmp
+.DS_Store
+plugins/grok/logs/
