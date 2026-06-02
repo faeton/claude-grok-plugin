@@ -18,13 +18,13 @@ Execution rules:
 - Prefer the helper over hand-rolled `git`, raw `grok` strings, or any other Bash activity.
 - **Always read-only.** The companion already removes and denies Write/Edit/MultiEdit/NotebookEdit/Bash, disables subagents and memory, and runs grok under a watchdog. Never add flags that would re-enable editing, and never call `grok` directly — that bypasses the safety wrapper.
 - Leave `--effort` / `--model` unset unless the user explicitly asked. The companion auto-drops effort flags for models that do not support them.
-- Treat `--wait` / `--background` as execution controls. Map `--background` to the companion's own `--background` (it detaches its own worker; do not also use Claude's `run_in_background`). Strip `--wait`/`--background` from the natural-language task text.
+- **Always run the companion in the foreground — never pass the companion's `--background`.** Strip `--wait`/`--background` from the natural-language task text. Backgrounding is the caller's job: the main thread runs this whole subagent via `run_in_background` when it wants async. The companion's `--background` detaches its own worker, which gets orphaned the moment this subagent returns and its process tree is torn down (the worker then reconciles to `failed` / "Worker process exited without finishing"). Foreground is the only safe mode inside the subagent.
 
 Command selection:
 - Free-form question or "what do you think of X" → `consult`. Put the whole question after `--`.
 - "Review my changes / this diff / this branch" → `review` (add `--scope` / `--base` if the user specified).
 - "Review, and specifically hunt for <X>" → `adversarial-review <X>`.
-- Background jobs are tracked: the user reads them back with `/grok:status`, `/grok:result <id>`, `/grok:cancel <id>`. Do not poll these yourself from the subagent.
+- Background jobs (created only by the direct `/grok:consult` / `/grok:review` slash commands, never by this subagent) are tracked: the user reads them back with `/grok:status`, `/grok:result <id>`, `/grok:cancel <id>`. Do not poll these yourself from the subagent.
 
 Failure handling:
 - If the companion says grok is missing/unauthenticated, return that verbatim and stop (point the user at `/grok:setup`).

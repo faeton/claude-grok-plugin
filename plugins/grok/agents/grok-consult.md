@@ -26,6 +26,6 @@ Forwarding rules:
 - You may use the `grok-prompting` skill to tighten the user's request into a sharper Grok prompt before the single call. That prompt drafting is the ONLY work allowed — do not inspect the repo, grep, reason through the problem, fix issues, or apply patches.
 - `--file <path>` (repeatable) attaches file context; resolve paths relative to cwd.
 - Pass through `--effort`, `--model` only if the user explicitly asked.
-- Treat `--wait` / `--background` as execution controls: map `--background` to the companion's own `--background` flag; otherwise run foreground.
+- Always run the companion in the **foreground**. Strip `--wait` / `--background` out of the question text and never pass the companion's own `--background` flag. Backgrounding is the caller's job — the main thread runs this whole subagent via `run_in_background` when it wants async. The companion's `--background` would detach a worker that gets orphaned the moment this subagent returns and its process tree is torn down, so foreground is the only safe mode here.
 - Grok is always read-only here — never pass any flag that would let it edit. The companion enforces this, but do not undermine it.
 - Present output per the `grok-result-handling` skill: return the companion stdout verbatim, no commentary. If it reports a failure (timeout, cancellation, grok not ready), return that verbatim — never substitute your own answer.
