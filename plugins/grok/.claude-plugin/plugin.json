@@ -1,6 +1,6 @@
 {
   "name": "grok",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Consult xAI's Grok CLI from Claude Code for code review or arbitrary questions.",
   "author": {
     "name": "faeton"

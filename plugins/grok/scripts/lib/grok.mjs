@@ -7,11 +7,73 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { homedir } from "node:os";
 
-export const DEFAULT_TIMEOUT_MS = 8 * 60_000;
+// Wall-clock watchdog. Runs that were allowed past the old 8-minute cap have
+// completed cleanly at 8.6min and 10.4min with full answers, so 8 minutes was
+// truncating real work, not catching hangs. There is no idle detection yet, so
+// this stays a bounded backstop rather than going higher.
+export const DEFAULT_TIMEOUT_MS = 15 * 60_000;
 export const GROK_BIN = process.env.GROK_BIN || "grok";
 
-// stopReasons that mean "Grok produced its answer and stopped cleanly".
-const GOOD_STOP_REASONS = new Set(["EndTurn", "Stop", "Completed", "MaxTurns"]);
+// Compare stopReasons case/separator-insensitively. The CLI switched from
+// PascalCase (`EndTurn`) to the snake_case ACP token (`end_turn`) in 1.0.4,
+// which silently turned every successful run into a reported failure.
+const normReason = (s) => String(s).toLowerCase().replace(/[\s_-]+/g, "");
+
+// Grok produced its answer and stopped cleanly. PascalCase spellings normalize
+// onto these too, so pre-1.0.4 CLIs keep working.
+const GOOD_STOP_REASONS = new Set(["endturn", "stop", "completed"]);
+
+// The run genuinely failed and any text is not a usable answer.
+const BAD_STOP_REASONS = new Set(["cancelled", "refusal"]);
+
+// The run hit a ceiling: whatever text arrived is real but incomplete. Worth
+// surfacing with a warning — discarding a truncated 10k-char analysis is the
+// exact failure mode this classifier exists to prevent.
+const TRUNCATED_STOP_REASONS = new Set([
+  "maxtokens",
+  "maxturns",
+  "maxturnrequests",
+  "maxturnsreached",
+]);
+
+// grok's docs call the stopReason list explicitly non-exhaustive, so an
+// unrecognized value must not fail closed the way the old allowlist did. Fail
+// open when there is substantial text to hand back, and fail loudly otherwise.
+const UNKNOWN_REASON_MIN_TEXT = 16;
+
+// Decide run outcome from the envelope. Single source of truth: callers must not
+// re-derive `ok` from text/exit code separately.
+export function classifyStopReason(stopReason, text) {
+  const body = (text ?? "").trim();
+  const n = stopReason ? normReason(stopReason) : "";
+
+  if (n === "cancelled") {
+    return {
+      ok: false,
+      errorMessage:
+        "grok stopped early (stopReason=cancelled) — the relay likely cancelled the request. Retry, or lower the request size.",
+    };
+  }
+  if (BAD_STOP_REASONS.has(n)) {
+    return { ok: false, errorMessage: `grok stopped early (stopReason=${stopReason}).` };
+  }
+  if (TRUNCATED_STOP_REASONS.has(n)) {
+    return body
+      ? { ok: true, warning: `Answer is truncated (stopReason=${stopReason}).` }
+      : { ok: false, errorMessage: `grok truncated with no text (stopReason=${stopReason}).` };
+  }
+  if (!n || GOOD_STOP_REASONS.has(n)) {
+    return body
+      ? { ok: true }
+      : {
+          ok: false,
+          errorMessage: "grok returned an empty response (possible relay cancellation).",
+        };
+  }
+  return body.length >= UNKNOWN_REASON_MIN_TEXT
+    ? { ok: true, warning: `Unrecognized stopReason=${stopReason}; answer returned as-is.` }
+    : { ok: false, errorMessage: `Unrecognized stopReason=${stopReason} with no usable text.` };
+}
 
 // Tools that can mutate the workspace or run arbitrary commands. We both remove
 // them (--disallowed-tools, so the model is never offered them) AND deny them
@@ -227,7 +289,14 @@ export function runGrok(args, options = {}) {
 
     const finish = (result) => {
       clearTimeout(watchdog);
-      if (killTimer) clearTimeout(killTimer);
+      // Deliberately NOT cancelling killTimer on a timed-out run. The group
+      // leader closing does not mean the group is gone: a descendant that
+      // ignores SIGTERM and drops the pipes would survive if escalation were
+      // cancelled here. unref() lets the process exit without waiting on it.
+      if (killTimer) {
+        if (timedOut) killTimer.unref?.();
+        else clearTimeout(killTimer);
+      }
       activeChildren.delete(child);
       resolveRun({ ...result, durationMs: Date.now() - startedAt });
     };
@@ -253,8 +322,9 @@ export function runGrok(args, options = {}) {
       const text = (envelope?.text ?? (envelope ? "" : stdout)).trim();
       const stopReason = envelope?.stopReason ?? null;
 
-      let ok = code === 0 && !timedOut && Boolean(text);
+      let ok;
       let errorMessage = null;
+      let warning = null;
       if (timedOut) {
         ok = false;
         errorMessage = `Timed out after ${timeoutMs}ms (no response from grok).`;
@@ -262,18 +332,18 @@ export function runGrok(args, options = {}) {
         ok = false;
         errorMessage =
           firstStderrLine(stderr) || `grok exited with code ${code}.`;
-      } else if (stopReason && !GOOD_STOP_REASONS.has(stopReason)) {
-        ok = false;
-        errorMessage = `grok stopped early (stopReason=${stopReason}) — the relay likely cancelled the request. Retry, or lower the request size.`;
-      } else if (!text) {
-        ok = false;
-        errorMessage =
-          firstStderrLine(stderr) ||
-          "grok returned an empty response (possible relay cancellation).";
+      } else {
+        const verdict = classifyStopReason(stopReason, text);
+        ok = verdict.ok;
+        warning = verdict.warning ?? null;
+        errorMessage = verdict.ok
+          ? null
+          : firstStderrLine(stderr) || verdict.errorMessage;
       }
 
       finish({
         ok,
+        warning,
         exitCode: timedOut ? 124 : code ?? 1,
         signal,
         timedOut,

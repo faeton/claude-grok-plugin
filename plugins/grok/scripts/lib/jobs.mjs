@@ -102,6 +102,11 @@ export async function runTrackedJob(job, runner, { onProgress } = {}) {
       pid: null,
       completedAt,
       stopReason: execution.stopReason ?? null,
+      // Persisted so timeouts can be counted directly instead of being inferred
+      // from durationMs or the error string (which silently conflates runs that
+      // used a custom --timeout with the default watchdog).
+      timedOut: execution.timedOut ?? false,
+      warning: execution.warning ?? null,
       summary: execution.summary ?? running.summary,
       errorMessage: execution.ok ? null : execution.errorMessage ?? "Run failed.",
       result: execution.payload,

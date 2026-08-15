@@ -13,7 +13,8 @@ function elapsed(job) {
 
 export function renderConsultResult(result) {
   if (result.ok) {
-    return result.text.trimEnd() + "\n";
+    const head = result.warning ? `[grok] ${result.warning}\n\n` : "";
+    return head + result.text.trimEnd() + "\n";
   }
   const lines = ["[grok] Consultation did not complete."];
   if (result.errorMessage) lines.push(result.errorMessage);
@@ -25,7 +26,8 @@ export function renderConsultResult(result) {
 export function renderReviewResult(result, { targetLabel } = {}) {
   if (result.ok) {
     const head = targetLabel ? `Grok review — ${targetLabel}\n\n` : "";
-    return head + result.text.trimEnd() + "\n";
+    const warn = result.warning ? `[grok] ${result.warning}\n\n` : "";
+    return head + warn + result.text.trimEnd() + "\n";
   }
   const lines = ["[grok] Review did not complete."];
   if (result.errorMessage) lines.push(result.errorMessage);
