@@ -32,16 +32,28 @@ rewriting your code. Early naive wrappers had three problems:
 
 This plugin fixes all three:
 
-- **Strictly read-only.** Every Grok invocation removes and denies the mutating
-  tools (`Write`, `Edit`, `MultiEdit`, `NotebookEdit`, `Bash`), disables
-  subagents and cross-session memory, and (for review) disables web search. The
-  deny rules override any allow-rules Grok would otherwise inherit. Grok
-  physically cannot edit your working tree.
-- **Honest failures.** Output is parsed from Grok's JSON envelope. A relay
-  cancellation (`stopReason: Cancelled`), a timeout, or an empty answer is
-  reported as a real, non-zero failure — never as a silent empty success. A
-  wall-clock watchdog (SIGTERM → SIGKILL on the process group) turns hangs into a
-  clear "timed out" result with no orphaned processes.
+- **Strictly read-only.** Every Grok invocation both *removes* the mutating tools
+  from the toolset (`run_terminal_cmd`, `search_replace`, `write_file`, … plus
+  `Agent` to block subagent spawning) and *denies* them at the permission layer,
+  disables cross-session memory, and (for review) disables web search. The deny
+  rules override any allow-rules Grok would otherwise inherit. Grok physically
+  cannot edit your working tree.
+
+  These are two different vocabularies and both matter: `--disallowed-tools`
+  takes Grok's **internal tool ids**, while `--allow`/`--deny` take
+  **Claude-style capability names**. Passing capability names to
+  `--disallowed-tools` removes nothing — they are silently ignored.
+- **Honest failures — in both directions.** A relay cancellation, a stall, or an
+  empty answer is reported as a real, non-zero failure, never as a silent empty
+  success. Just as importantly, a *completed* answer is never thrown away:
+  stop-reason matching is case- and separator-insensitive and fails open on
+  unrecognized values that carry text, because Grok documents its stop-reason
+  list as non-exhaustive. Truncated answers (`max_tokens`, `max_turn_requests`)
+  are returned with a warning rather than discarded.
+- **Stall detection.** Runs stream their events, so a stalled relay is caught as
+  an absence of output within minutes instead of burning the full watchdog. A
+  wall-clock backstop (SIGTERM → SIGKILL on the process group) still bounds the
+  worst case, with no orphaned processes.
 - **Background jobs with status.** Long consultations/reviews run as detached
   workers tracked in an on-disk registry. Check them with `/grok:status`,
   read them with `/grok:result`, stop them with `/grok:cancel`. Job state lives
@@ -96,7 +108,11 @@ fix if not.
 - `--effort <low|medium|high|xhigh|max>` — reasoning effort. Automatically
   dropped if the target model doesn't support it (so it never 400s).
 - `--scope auto|working-tree|branch` and `--base <ref>` — for reviews.
-- `--timeout-ms <ms>` — watchdog timeout (default 8 minutes).
+- `--timeout-ms <ms>` — wall-clock backstop (default 15 minutes).
+- `--idle-ms <ms>` — kill a run that produces no output at all for this long
+  (default 3 minutes). Catches a stalled relay long before the backstop. Don't
+  set it much lower: Grok can spend up to 120s draining usage after the answer
+  without emitting anything.
 
 ### Examples
 
@@ -135,12 +151,22 @@ scripts/
                         status/result/cancel (+ internal consult-worker)
   lib/
     args.mjs      schema-driven arg parser (handles quotes, escapes, "--" tail)
-    grok.mjs      the grok CLI runner: read-only flags, watchdog, JSON envelope
+    grok.mjs      the grok CLI runner: read-only flags, idle + wall-clock
+                  watchdogs, streaming event parsing, stop-reason classification
     git.mjs       review-context construction from git state
     state.mjs     on-disk job registry (atomic writes, locked index)
     jobs.mjs      job lifecycle: create → run → terminal; orphan reconciliation
     render.mjs    human-readable output
 ```
+
+Run the test suite with:
+
+```text
+node plugins/grok/scripts/test/runner.test.mjs
+```
+
+It replays Grok's real streaming wire format through a stub binary — no
+dependencies, no network.
 
 The model is the same one the codex plugin uses: a **thin forwarder**. Slash
 commands and the subagent never reason through your problem or act on Grok's
@@ -152,10 +178,13 @@ review the findings and apply changes yourself.
 Each `grok` call is constructed with:
 
 ```
---disallowed-tools Write,Edit,MultiEdit,NotebookEdit,Bash   # tools removed entirely
---deny Write --deny Edit --deny Bash                        # overrides inherited allow-rules
+# Grok's INTERNAL tool ids — capability names here are silently ignored:
+--disallowed-tools run_terminal_cmd,run_terminal_command,search_replace,\
+                   write_file,create_file,apply_patch,delete_file,Agent
+# Claude-style CAPABILITY names — a different vocabulary, gates execution:
+--deny Write --deny Edit --deny Bash
 --no-subagents --no-memory                                  # no side channels
---output-format json                                        # parseable, detect cancellation
+--output-format streaming-json                              # parseable + liveness signal
 [--disable-web-search]                                      # reviews only
 ```
 

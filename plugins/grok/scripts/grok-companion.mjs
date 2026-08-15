@@ -2,17 +2,21 @@
 // Companion for driving the local `grok` CLI from a Claude Code plugin.
 //
 // Grok is used STRICTLY READ-ONLY here: consult and review are second-opinion
-// tools, never agents. Every grok invocation removes and denies the mutating
-// tools (Write/Edit/MultiEdit/NotebookEdit/Bash), disables subagents/memory, and
-// runs under a wall-clock watchdog. Output is parsed from grok's JSON envelope so
-// a relay cancellation surfaces as a real failure instead of silent empty stdout.
+// tools, never agents. Every grok invocation removes the mutating tools by their
+// grok-internal ids (run_terminal_cmd/search_replace/write_file/... plus Agent)
+// AND denies them by Claude-style capability name — two different vocabularies,
+// see readOnlyArgs in lib/grok.mjs. Memory is disabled, and runs are bounded by
+// both an idle timer and a wall-clock backstop. Output is parsed from grok's
+// streaming-json events so a stall or cancellation surfaces as a real failure
+// instead of silent empty stdout — and, just as importantly, so a completed
+// answer is never discarded because of an unrecognized stopReason.
 //
 // Subcommands:
 //   setup [--json]
 //   consult [--background] [--file <p>]... [--model <id>] [--effort <lvl>]
-//           [--timeout-ms <ms>] [--json] -- <question>
+//           [--timeout-ms <ms>] [--idle-ms <ms>] [--json] -- <question>
 //   review  [--background] [--base <ref>] [--scope auto|working-tree|branch]
-//           [--model <id>] [--timeout-ms <ms>] [--json]
+//           [--model <id>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json]
 //   adversarial-review [...same as review...] [focus text]
 //   consult-worker --job-id <id>        (internal: detached background worker)
 //   status [job-id] [--all] [--wait] [--timeout-ms <ms>] [--json]
@@ -33,6 +37,7 @@ import {
   resolveReviewTarget,
 } from "./lib/git.mjs";
 import {
+  DEFAULT_IDLE_MS,
   DEFAULT_TIMEOUT_MS,
   effortArgs,
   getGrokAuthStatus,
@@ -117,6 +122,33 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+// `--idle-ms 0` disables idle detection, so a plain `Number(x) || DEFAULT`
+// would silently turn the documented off-switch back into the default.
+function parseIdleMs(raw) {
+  if (raw === undefined || raw === null || raw === "") return DEFAULT_IDLE_MS;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_IDLE_MS;
+}
+
+// Map a streaming-json ACP event onto a job-progress update.
+//
+// Deliberately selective: every progress event with a `message` appends to the
+// job log, and answer text arrives as a long sequence of `text` chunks. Echoing
+// those would rewrite the log on every token, so only tool activity and errors
+// are surfaced — the answer itself is recorded once at the end.
+function streamPhase(event) {
+  switch (event?.type) {
+    case "tool_call":
+      return { message: `→ ${shorten(event.title || event.toolName || "tool", 60)}` };
+    case "error":
+      return { message: `grok error: ${shorten(event.message, 200)}` };
+    case "end":
+      return { phase: "finishing" };
+    default:
+      return {};
+  }
+}
+
 // ---------- setup ----------
 
 async function handleSetup(argv) {
@@ -140,7 +172,15 @@ async function handleSetup(argv) {
 
 function parseConsultOptions(argv) {
   const { options, positionals } = parseArgs(normalizeArgv(argv), {
-    valueOptions: ["model", "effort", "reasoning-effort", "timeout-ms", "cwd", "question"],
+    valueOptions: [
+      "model",
+      "effort",
+      "reasoning-effort",
+      "timeout-ms",
+      "idle-ms",
+      "cwd",
+      "question",
+    ],
     repeatable: ["file"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: { m: "model" },
@@ -155,6 +195,7 @@ function parseConsultOptions(argv) {
     effort: options.effort || null,
     reasoningEffort: options["reasoning-effort"] || null,
     timeoutMs: Number(options["timeout-ms"]) || DEFAULT_TIMEOUT_MS,
+    idleMs: parseIdleMs(options["idle-ms"]),
     files: options.file ?? [],
     question,
   };
@@ -167,8 +208,10 @@ async function runConsult(req, progress) {
   const args = [
     "-p",
     prompt,
+    // streaming-json (not `stream-json`) so a stalled relay is visible as an
+    // absence of events rather than an 8-minute silence.
     "--output-format",
-    "json",
+    "streaming-json",
     "--permission-mode",
     "default",
     ...readOnlyArgs({ web: true }),
@@ -180,6 +223,8 @@ async function runConsult(req, progress) {
   const result = await runGrok(args, {
     cwd: req.cwd,
     timeoutMs: req.timeoutMs,
+    idleMs: req.idleMs,
+    onProgress: (event) => progress?.(streamPhase(event)),
     onSpawn: ({ pid }) => progress?.({ grokPid: pid }),
   });
   return {
@@ -190,6 +235,7 @@ async function runConsult(req, progress) {
     summary: shorten(result.text || result.errorMessage || req.question),
     warning: result.warning,
     timedOut: result.timedOut,
+    idledOut: result.idledOut,
     payload: {
       ok: result.ok,
       text: result.text,
@@ -197,6 +243,7 @@ async function runConsult(req, progress) {
       sessionId: result.sessionId,
       warning: result.warning,
       timedOut: result.timedOut,
+      idledOut: result.idledOut,
       errorMessage: result.errorMessage,
       durationMs: result.durationMs,
     },
@@ -236,7 +283,7 @@ async function handleConsult(argv) {
 
 function parseReviewOptions(argv) {
   const { options, positionals } = parseArgs(normalizeArgv(argv), {
-    valueOptions: ["base", "scope", "model", "timeout-ms", "cwd"],
+    valueOptions: ["base", "scope", "model", "timeout-ms", "idle-ms", "cwd"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: { m: "model" },
   });
@@ -248,6 +295,7 @@ function parseReviewOptions(argv) {
     scope: options.scope || "auto",
     model: options.model || null,
     timeoutMs: Number(options["timeout-ms"]) || DEFAULT_TIMEOUT_MS,
+    idleMs: parseIdleMs(options["idle-ms"]),
     focusText: positionals.join(" ").trim(),
   };
 }
@@ -273,7 +321,7 @@ async function runReview(req, kind, progress) {
     "-p",
     prompt,
     "--output-format",
-    "json",
+    "streaming-json",
     "--permission-mode",
     "default",
     ...readOnlyArgs({ web: false }),
@@ -284,6 +332,8 @@ async function runReview(req, kind, progress) {
   const result = await runGrok(args, {
     cwd: req.cwd,
     timeoutMs: req.timeoutMs,
+    idleMs: req.idleMs,
+    onProgress: (event) => progress?.(streamPhase(event)),
     onSpawn: ({ pid }) => progress?.({ grokPid: pid }),
   });
   return {
@@ -294,6 +344,7 @@ async function runReview(req, kind, progress) {
     summary: `${target.label}: ${shorten(result.text || result.errorMessage || "review", 50)}`,
     warning: result.warning,
     timedOut: result.timedOut,
+    idledOut: result.idledOut,
     payload: {
       ok: result.ok,
       text: result.text,
@@ -301,6 +352,7 @@ async function runReview(req, kind, progress) {
       stopReason: result.stopReason,
       warning: result.warning,
       timedOut: result.timedOut,
+      idledOut: result.idledOut,
       errorMessage: result.errorMessage,
       durationMs: result.durationMs,
     },
@@ -547,8 +599,11 @@ function usage() {
   return [
     "Usage:",
     "  grok-companion.mjs setup [--json]",
-    '  grok-companion.mjs consult [--background] [--file <p>]... [--model <id>] [--timeout-ms <ms>] [--json] -- <question>',
-    "  grok-companion.mjs review [--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <id>] [--json]",
+    '  grok-companion.mjs consult [--background] [--file <p>]... [--model <id>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json] -- <question>',
+    "  grok-companion.mjs review [--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <id>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json]",
+    "",
+    "  --timeout-ms  wall-clock backstop (default 15m).",
+    "  --idle-ms     kill after this long with no output at all (default 3m, 0 disables).",
     "  grok-companion.mjs adversarial-review [...review flags...] [focus text]",
     "  grok-companion.mjs status [job-id] [--all] [--wait] [--json]",
     "  grok-companion.mjs result [job-id] [--json]",

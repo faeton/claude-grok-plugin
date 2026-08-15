@@ -106,6 +106,9 @@ export async function runTrackedJob(job, runner, { onProgress } = {}) {
       // from durationMs or the error string (which silently conflates runs that
       // used a custom --timeout with the default watchdog).
       timedOut: execution.timedOut ?? false,
+      // Recorded separately: an idle kill also sets timedOut, so without this a
+      // stalled relay is indistinguishable from hitting the wall-clock backstop.
+      idledOut: execution.idledOut ?? false,
       warning: execution.warning ?? null,
       summary: execution.summary ?? running.summary,
       errorMessage: execution.ok ? null : execution.errorMessage ?? "Run failed.",
