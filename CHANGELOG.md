@@ -4,6 +4,71 @@ All notable changes to this plugin are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-10-16
+
+Grok reviews and consults now finish in 1-4 minutes instead of timing out.
+Benchmarked against Codex and Claude on identical prompts with planted-bug
+answer keys; the numbers are in the README.
+
+### Added
+
+- **Profiles: `--profile fast|thrifty|deep` and `GROK_PLUGIN_PROFILE`.** `fast`
+  (the default) is `grok-4.7-build-fast` at `low`; `thrifty` is `grok-4.7` at
+  `low`, about twice as slow on about half the subscription allowance
+  (build-fast is billed at twice the per-token price); `deep` is `grok-4.7` at
+  `medium`. `--model` / `--effort` still override any profile.
+- **Reviews include the full text of the changed files** (150 KB budget,
+  lockfiles and minified files skipped, `GROK_PLUGIN_INLINE_BYTES` to change
+  it). With the files inlined every benchmarked config found every planted bug,
+  including `grok-4.7` at `low`, which missed the cross-file one every time
+  from the diff alone.
+
+### Changed
+
+- **Default model `grok-4.7-build-fast`, default effort `low`.** At the old
+  `grok-4.7` / `medium`, branch reviews took 4-15 minutes with 40-80 tool calls
+  and often hit the timeout. The time went to model generation: tools finished
+  in milliseconds, but each step ran a slow reasoning pass. The new default
+  found the same bugs, including a cross-file one that `grok-4.7` at `low`
+  missed every time, in under a minute. With no model default, runs used to
+  inherit whatever the grok CLI was set to. Use `--profile deep` (or
+  `GROK_PLUGIN_PROFILE=deep`) for the old behavior.
+- **Review and consult prompts end with a working method.** Left alone, grok
+  read files in small pages, re-read the same file up to 7 times, and surveyed
+  unrelated code. The prompt now asks it to check every changed hunk and what
+  depends on it, batch reads, read whole functions, and skip unrelated code. A
+  hard "at most N tool calls" cap was tried first and dropped: it sometimes cut
+  the read that found the cross-file bug.
+- **Lean child environment.** grok scanned Claude Code's and Cursor's skills,
+  MCP servers and hooks by default, which added about 21 KB of skill
+  descriptions to every model call. These are now off for grok runs. Project
+  rules and `CLAUDE.md` stay on.
+- **Wall-clock timeout 15 → 8 minutes.** This keeps a foreground run inside
+  Claude Code's 10-minute Bash cap, so the run finishes and reports instead of
+  being moved to the background. The subagent, runtime skill and slash
+  commands now pass an explicit Bash `timeout: 600000`. Without it, the
+  2-minute default cut runs off.
+
+### Fixed
+
+- **A timeout says what grok was doing.** "Timed out (no response from grok)"
+  was wrong for the usual case: a run that was busy reading and reasoning until
+  the deadline. The message now gives the tool-call count and how long ago the
+  last activity was.
+- **An unfinished run keeps its work.** The end of grok's reasoning stream,
+  where a timed-out review held its whole investigation, is now shown as
+  working notes and saved in the job record. Before, all that was kept was the
+  first preamble sentence.
+- **A run that stopped before answering fails.** A `max_turn_requests`,
+  `tool_use` or `pause_turn` stop with only a preamble was reported as a
+  completed job. It now fails, with the text kept as partial output.
+  `max_tokens` (an answer cut mid-write) is still returned with a warning.
+- **Effort support detection.** A model whose cache entry has a
+  `reasoning_efforts` menu but no `supports_reasoning_effort` field was treated
+  as unsupported.
+- The companion's exit log recorded `ok: true` even for failed runs.
+- Job records now store the model, effort, tool-call count and grok session id.
+
 ## [0.5.1] — 2026-10-16
 
 ### Fixed

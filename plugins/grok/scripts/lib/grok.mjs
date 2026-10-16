@@ -7,12 +7,13 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 
-// Wall-clock watchdog. Runs that were allowed past the old 8-minute cap have
-// completed cleanly at 8.6min and 10.4min with full answers, so 8 minutes was
-// truncating real work, not catching hangs. Stalls are caught much earlier by
-// the idle timer below; this is only the bounded backstop for a run that keeps
-// talking but never finishes.
-export const DEFAULT_TIMEOUT_MS = 15 * 60_000;
+// Wall-clock watchdog. Under 9 minutes so a foreground run finishes, and saves
+// its result, inside Claude Code's 10-minute Bash cap. The old 15-minute cap
+// outlived that cap, so Claude moved the call to the background mid-run and the
+// caller saw a "stuck" consult. With the fast defaults below a review takes
+// 1-2 minutes; this is only the backstop for a run that keeps working but never
+// finishes. Stalls are caught much earlier by the idle timer.
+export const DEFAULT_TIMEOUT_MS = 8 * 60_000;
 
 // Kill a run that has produced NO output at all for this long. A stalled relay
 // is silent, so this catches it in minutes instead of burning the full wall
@@ -36,12 +37,69 @@ export const PROMPT_DIR_PREFIX = "grok-companion-prompt-";
 // run's own watchdogs exist, so it needs its own.
 const MODEL_PROBE_TIMEOUT_MS = 10_000;
 
-// Reasoning effort sent when the caller does not pass --effort. The grok CLI's
-// own default is `high`, which makes routine consults and reviews very slow.
-// Override globally with GROK_PLUGIN_EFFORT (e.g. in ~/.claude/settings.json
-// "env"), or per call with --effort. GROK_PLUGIN_EFFORT=default sends no flag
-// and lets the CLI pick.
-export const DEFAULT_EFFORT = process.env.GROK_PLUGIN_EFFORT || "medium";
+// Model and reasoning effort, chosen as a named profile. Measured on identical
+// review prompts (2026-10-16, grok CLI 1.0.60, on two machines): grok-4.7 at
+// medium took 4-15 minutes, made 40-72 tool calls and timed out on real branch
+// reviews. grok-4.7-build-fast at low found the same planted bugs, including one
+// that needs cross-file context, in about a minute. grok-4.7 at low missed that
+// bug every time from the diff alone, but found it once the changed files were
+// inlined in full, at about half build-fast's cost and twice its time.
+// build-fast is billed at twice grok-4.7's per-token price, so on a subscription
+// it uses the allowance faster.
+//
+// Without a model default the run inherited whatever the user's grok CLI was
+// set to, so speed changed with unrelated settings.
+export const PROFILES = {
+  fast: { model: "grok-4.7-build-fast", effort: "low" },
+  thrifty: { model: "grok-4.7", effort: "low" },
+  deep: { model: "grok-4.7", effort: "medium" },
+};
+export const DEFAULT_PROFILE = "fast";
+
+// Precedence, highest first: --model / --effort, --profile, GROK_PLUGIN_MODEL /
+// GROK_PLUGIN_EFFORT, GROK_PLUGIN_PROFILE, then `fast`. The env vars are read at
+// call time (set them in ~/.claude/settings.json "env"). `default` for a model
+// or effort sends no flag and lets the CLI pick.
+export function resolveProfile(name) {
+  const n = name || process.env.GROK_PLUGIN_PROFILE || DEFAULT_PROFILE;
+  const p = Object.hasOwn(PROFILES, n) ? PROFILES[n] : null;
+  if (!p) {
+    const src = name ? "--profile" : "GROK_PLUGIN_PROFILE";
+    throw new Error(`Unknown ${src} "${n}" (expected ${Object.keys(PROFILES).join(", ")}).`);
+  }
+  return { name: n, ...p, explicit: Boolean(name) };
+}
+
+// Resolve the model a run uses, or null for "send no --model flag".
+export function resolveModel(model, profile) {
+  const p = resolveProfile(profile);
+  const m = model || (p.explicit ? p.model : process.env.GROK_PLUGIN_MODEL || p.model);
+  return m === "default" ? null : m;
+}
+
+function resolveEffort(effort, profile) {
+  const p = resolveProfile(profile);
+  return effort || (p.explicit ? p.effort : process.env.GROK_PLUGIN_EFFORT || p.effort);
+}
+
+// Environment for every grok child. grok scans Claude Code's and Cursor's
+// skills, MCP servers and hooks by default: on a typical Claude Code machine
+// that put ~21 KB of Claude skill descriptions and several MCP servers into
+// every model call, irrelevant to a read-only review and resent on every loop.
+// Hooks are off for safety as much as speed: they run commands. Project rules
+// and CLAUDE.md stay on, since they carry the repo's real constraints.
+export const LEAN_ENV = {
+  GROK_CLAUDE_SKILLS_ENABLED: "0",
+  GROK_CLAUDE_MCPS_ENABLED: "0",
+  GROK_CLAUDE_HOOKS_ENABLED: "0",
+  GROK_CURSOR_SKILLS_ENABLED: "0",
+  GROK_CURSOR_MCPS_ENABLED: "0",
+  GROK_CURSOR_HOOKS_ENABLED: "0",
+};
+
+export function childEnv(base = process.env) {
+  return { ...base, ...LEAN_ENV };
+}
 
 // Compare stopReasons case/separator-insensitively. The CLI switched from
 // PascalCase (`EndTurn`) to the snake_case ACP token (`end_turn`) in 1.0.4,
@@ -55,15 +113,17 @@ const GOOD_STOP_REASONS = new Set(["endturn", "stop", "completed"]);
 // The run genuinely failed and any text is not a usable answer.
 const BAD_STOP_REASONS = new Set(["cancelled", "refusal"]);
 
-// The run hit a ceiling: whatever text arrived is real but incomplete. Worth
-// surfacing with a warning — discarding a truncated 10k-char analysis is the
-// exact failure mode this classifier exists to prevent.
-//
-// `tool_use` / `pause_turn` as a TURN reason mean the model stopped to call a
-// tool (most likely one the read-only policy then refused) and never wrote its
-// final answer, so the text is a partial analysis, not a finished one.
-const TRUNCATED_STOP_REASONS = new Set([
-  "maxtokens",
+// The answer was being written and got cut by the output-token limit: the text
+// is real but incomplete. Surfaced with a warning, since discarding a truncated
+// 10k-char analysis is the exact failure mode this classifier exists to prevent.
+const TRUNCATED_STOP_REASONS = new Set(["maxtokens"]);
+
+// The model ran out of turns, or stopped to call a tool (most likely one the
+// read-only policy refused), before it ever wrote its answer. What text exists
+// is commentary from before the investigation ("I'll review the catch code…"),
+// not a result. Reporting it as a completed job made a one-sentence preamble
+// look like a clean review, so it fails, with the text kept as partial output.
+const UNFINISHED_STOP_REASONS = new Set([
   "maxturns",
   "maxturnrequests",
   "maxturnsreached",
@@ -96,6 +156,12 @@ export function classifyStopReason(stopReason, text) {
     return body
       ? { ok: true, warning: `Answer is truncated (stopReason=${stopReason}).` }
       : { ok: false, errorMessage: `grok truncated with no text (stopReason=${stopReason}).` };
+  }
+  if (UNFINISHED_STOP_REASONS.has(n)) {
+    return {
+      ok: false,
+      errorMessage: `grok stopped before writing its answer (stopReason=${stopReason}).`,
+    };
   }
   if (!n || GOOD_STOP_REASONS.has(n)) {
     return body
@@ -245,33 +311,38 @@ export function detectDefaultModel() {
 }
 
 // Returns true/false from grok's models cache, or null when it cannot tell
-// (no cache, unreadable cache, or a model id the cache does not list).
+// (no cache, unreadable cache, a model id the cache does not list, or an entry
+// that says nothing about effort). An advertised `reasoning_efforts` menu is
+// support; only an explicit `supports_reasoning_effort: false` is "unsupported".
+// A missing field used to count as false, which silently dropped the flag.
 export function modelSupportsReasoningEffort(modelId) {
   try {
     const cachePath = resolve(GROK_HOME, "models_cache.json");
     const cache = JSON.parse(readFileSync(cachePath, "utf8"));
-    const entry = cache.models?.[modelId];
-    if (!entry) return null;
-    return Boolean(entry.info?.supports_reasoning_effort);
+    const info = cache.models?.[modelId]?.info;
+    if (!info) return null;
+    if (Array.isArray(info.reasoning_efforts) && info.reasoning_efforts.length) return true;
+    if (typeof info.supports_reasoning_effort === "boolean") return info.supports_reasoning_effort;
+    return null;
   } catch {
     return null;
   }
 }
 
 // Build the effort-related argv. Returns { args, dropped } where dropped is a
-// message or null. When neither flag is given, DEFAULT_EFFORT applies.
+// message or null. When neither flag is given, the profile's effort applies.
 //
 // The flag is dropped ONLY when the cache positively says the model lacks
 // support (the API 400s on the knob then). Unknown support sends it: treating
 // "unknown" as "unsupported" meant a cold or stale cache silently fell back to
-// the CLI's slow `high` default — the very thing DEFAULT_EFFORT exists to stop.
+// the CLI's slow `high` default — the very thing the effort default exists to stop.
 // --effort and --reasoning-effort are aliases in the CLI, so only one is sent.
-export function effortArgs({ effort, reasoningEffort, model }) {
+export function effortArgs({ effort, reasoningEffort, model, profile }) {
   const explicit = Boolean(effort || reasoningEffort);
-  let level = effort || reasoningEffort || DEFAULT_EFFORT;
+  let level = resolveEffort(effort || reasoningEffort, profile);
   if (level === "default") level = null;
   if (!level) return { args: [], dropped: null };
-  const targetModel = model || detectDefaultModel();
+  const targetModel = resolveModel(model, profile) || detectDefaultModel();
   const supported = targetModel ? modelSupportsReasoningEffort(targetModel) : null;
   if (supported !== false) return { args: ["--effort", level], dropped: null };
   if (!explicit) return { args: [], dropped: null };
@@ -472,6 +543,7 @@ export function runGrok(args, options = {}) {
       }
       child = spawn(GROK_BIN, args, {
         cwd,
+        env: childEnv(),
         detached: true,
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -542,23 +614,28 @@ export function runGrok(args, options = {}) {
     // across a socket read would otherwise be parsed as two invalid fragments
     // and silently dropped from onProgress.
     let pending = "";
+    // What the run was doing, so a timeout can say so instead of "no response".
+    const activity = { toolCalls: 0, lastEventAt: null };
 
     child.stdout.on("data", (buf) => {
       touch();
       const chunk = buf.toString("utf8");
       stdout += chunk;
-      if (!onProgress) return;
       pending += chunk;
       const lines = pending.split(/\r?\n/);
       pending = lines.pop() ?? ""; // last element is incomplete until a newline
       for (const line of lines) {
         const t = line.trim();
         if (!t) continue;
+        let event;
         try {
-          onProgress(JSON.parse(t));
+          event = JSON.parse(t);
         } catch {
-          /* not a json line */
+          continue; /* not a json line */
         }
+        activity.lastEventAt = Date.now();
+        if (event?.type === "tool_call") activity.toolCalls++;
+        onProgress?.(event);
       }
     });
     child.stderr.on("data", (buf) => {
@@ -651,7 +728,7 @@ export function runGrok(args, options = {}) {
           `Retry, or lower the request size.`;
       } else if (timedOut) {
         ok = false;
-        errorMessage = `Timed out after ${timeoutMs}ms (no response from grok).`;
+        errorMessage = timeoutMessage(timeoutMs, activity);
       } else if (code !== 0) {
         ok = false;
         // An `error` event carries grok's own description of the failure, which
@@ -707,6 +784,7 @@ export function runGrok(args, options = {}) {
         stopReason,
         sessionId: envelope?.sessionId ?? null,
         thought: envelope?.thought ?? null,
+        toolCalls: activity.toolCalls,
         stderr,
         errorMessage,
         raw: envelope,
@@ -715,6 +793,21 @@ export function runGrok(args, options = {}) {
   });
 }
 
+// The wall-clock deadline fired. Say what grok was doing: the old "no response
+// from grok" was wrong for the common case of a run that was busy reading files
+// and reasoning right up to the deadline.
+export function timeoutMessage(timeoutMs, { toolCalls = 0, lastEventAt = null } = {}, now = Date.now()) {
+  const secs = Math.round(timeoutMs / 1000);
+  if (!lastEventAt) {
+    return `Timed out after ${secs}s with no output from grok.`;
+  }
+  const ago = Math.max(0, Math.round((now - lastEventAt) / 1000));
+  return (
+    `Timed out after ${secs}s before grok wrote its answer. It was still working ` +
+    `(${toolCalls} tool call${toolCalls === 1 ? "" : "s"}, last activity ${ago}s ago). ` +
+    `Narrow the question or diff, or raise --timeout-ms.`
+  );
+}
 function firstStderrLine(stderr) {
   const line = String(stderr ?? "")
     .split(/\r?\n/)

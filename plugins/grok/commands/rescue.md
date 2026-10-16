@@ -17,5 +17,5 @@ Routing rules:
   - If `$ARGUMENTS` includes `--background`, run the subagent in the background.
   - If it includes `--wait`, run it in the foreground.
   - Otherwise default to foreground for a small, clearly bounded ask; background for a large or open-ended one.
-- `--file <path>` and any `--effort` / `--model` flags are for Grok — leave them in the forwarded text so the subagent passes them through.
+- `--file <path>` and any `--profile` / `--effort` / `--model` flags are for Grok — leave them in the forwarded text so the subagent passes them through.
 - Return the subagent's output verbatim. Do not paraphrase, summarize, or act on Grok's findings in this turn.

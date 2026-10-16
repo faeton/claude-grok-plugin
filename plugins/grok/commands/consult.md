@@ -1,6 +1,6 @@
 ---
 description: Ask Grok a free-form question, optionally with file context (read-only)
-argument-hint: '[--wait|--background] [--model <id>] [--effort <level>] [--file <path>]... -- <question>'
+argument-hint: '[--wait|--background] [--profile fast|thrifty|deep] [--model <id>] [--effort <level>] [--file <path>]... -- <question>'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), AskUserQuestion
 ---
@@ -13,7 +13,7 @@ Raw slash-command arguments:
 Argument shape:
 - Everything after `--` is the question text.
 - `--file <path>` (repeatable) attaches a file as context. Resolve paths relative to the current working directory.
-- `--model`, `--effort`, `--reasoning-effort` are passed through to Grok. The companion drops effort flags automatically if the target model does not support them.
+- `--profile`, `--model`, `--effort`, `--reasoning-effort` are passed through to Grok. The companion drops effort flags automatically if the target model does not support them.
 
 If you cannot tell the question from the flags (no `--` separator and it is ambiguous), use `AskUserQuestion` once to clarify.
 
@@ -24,7 +24,7 @@ Execution mode:
 
 Shell quoting (required): pass the raw arguments to the companion as ONE single-quoted shell word, written in place of `'<raw arguments>'` below. Escape every `'` inside them as `'\''`. Never paste the arguments unquoted or inside double quotes — `$(...)`, backticks, `;` and globs in a question or focus text would be run by the shell. The companion splits that single word into flags itself.
 
-Foreground:
+Foreground (give the Bash call `timeout: 600000`; the default 2-minute cap would cut the run off):
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" consult '<raw arguments>'
 ```

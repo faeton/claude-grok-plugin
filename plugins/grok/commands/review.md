@@ -1,6 +1,6 @@
 ---
 description: Run a Grok code review against local git state (read-only)
-argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <id>] [--effort <level>]'
+argument-hint: '[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [--profile fast|thrifty|deep] [--model <id>] [--effort <level>]'
 disable-model-invocation: true
 allowed-tools: Read, Glob, Grep, Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -23,12 +23,12 @@ Execution mode rules:
   - `Run in background`
 
 Argument handling:
-- Preserve the user's arguments. `--scope`, `--base`, `--model`, `--effort` pass through to the companion.
+- Preserve the user's arguments. `--scope`, `--base`, `--profile`, `--model`, `--effort` pass through to the companion.
 - `/grok:review` does not take focus text. For focused/adversarial framing use `/grok:adversarial-review`.
 
 Shell quoting (required): pass the raw arguments to the companion as ONE single-quoted shell word, written in place of `'<raw arguments>'` below. Escape every `'` inside them as `'\''`. Never paste the arguments unquoted or inside double quotes — `$(...)`, backticks, `;` and globs in a question or focus text would be run by the shell. The companion splits that single word into flags itself.
 
-Foreground:
+Foreground (give the Bash call `timeout: 600000`; the default 2-minute cap would cut the run off):
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" review '<raw arguments>'
 ```

@@ -64,11 +64,11 @@ for (const [reason, text, expected, label] of [
   ["Cancelled", TEXT, false, "Cancelled normalizes and fails"],
   ["refusal", TEXT, false, "refusal fails even with text"],
   ["max_tokens", TEXT, true, "max_tokens kept as truncated"],
-  ["max_turn_requests", TEXT, true, "max_turn_requests kept as truncated"],
-  ["MaxTurns", TEXT, true, "MaxTurns kept as truncated"],
+  ["max_turn_requests", TEXT, false, "max_turn_requests fails: the answer was never written"],
+  ["MaxTurns", TEXT, false, "MaxTurns normalizes and fails"],
   ["max_tokens", "", false, "truncated with no text fails"],
   ["a_future_reason", TEXT, true, "unknown reason with text fails OPEN"],
-  ["tool_use", TEXT, true, "tool_use turn kept as truncated"],
+  ["tool_use", TEXT, false, "tool_use turn fails: it stopped mid-investigation"],
   ["pause_turn", "", false, "pause_turn with no text fails"],
   ["a_future_reason", "hi", false, "unknown reason without real text fails"],
 ]) {
@@ -137,7 +137,8 @@ r = await runFake(
   "tooluse",
   emit([{ type: "text", data: "partial analysis so far" }, { type: "end", stopReason: "tool_use" }]),
 );
-check("turn ending on tool_use is flagged as truncated", r.ok === true && /truncated/.test(r.warning || ""), r);
+check("turn ending on tool_use fails as unfinished", r.ok === false && /before writing its answer/.test(r.errorMessage || ""), r);
+check("unfinished turn keeps its text as partial output", r.text === "partial analysis so far", r.text);
 
 r = await runFake(
   "errorevent",
@@ -268,6 +269,8 @@ writeFileSync(
     models: {
       "m-yes": { info: { supports_reasoning_effort: true } },
       "m-no": { info: { supports_reasoning_effort: false } },
+      "m-menu": { info: { reasoning_efforts: [{ id: "low" }, { id: "high" }] } },
+      "m-silent": { info: {} },
     },
   }),
 );
@@ -279,19 +282,26 @@ async function effortFor(name, req, env = {}) {
   process.env.GROK_HOME = home;
   if (env.effort === undefined) delete process.env.GROK_PLUGIN_EFFORT;
   else process.env.GROK_PLUGIN_EFFORT = env.effort;
+  // These cases probe the CLI's own default model, so the plugin's model
+  // default is switched off unless a case sets one.
+  process.env.GROK_PLUGIN_MODEL = env.pluginModel ?? "default";
   const mod = await import(`${LIB}?effort=${name}`);
   return mod.effortArgs(req);
 }
 let e = await effortFor("default", {});
-check("default effort is medium", e.args.join(" ") === "--effort medium", e);
+check("default effort is low", e.args.join(" ") === "--effort low", e);
 e = await effortFor("explicit", { effort: "high" });
 check("explicit effort wins", e.args.join(" ") === "--effort high", e);
-e = await effortFor("envset", {}, { effort: "low" });
-check("GROK_PLUGIN_EFFORT sets the default", e.args.join(" ") === "--effort low", e);
+e = await effortFor("envset", {}, { effort: "medium" });
+check("GROK_PLUGIN_EFFORT sets the default", e.args.join(" ") === "--effort medium", e);
 e = await effortFor("envdefault", {}, { effort: "default" });
 check("GROK_PLUGIN_EFFORT=default sends no flag", e.args.length === 0 && !e.dropped, e);
 e = await effortFor("unknown", {}, { defaultModel: "m-uncached" });
-check("unknown support still sends the default", e.args.join(" ") === "--effort medium", e);
+check("unknown support still sends the default", e.args.join(" ") === "--effort low", e);
+e = await effortFor("menu", {}, { defaultModel: "m-menu" });
+check("an advertised effort menu counts as support", e.args.join(" ") === "--effort low", e);
+e = await effortFor("silent", { effort: "high", model: "m-silent" });
+check("an entry silent on effort is unknown, so the flag is sent", e.args.join(" ") === "--effort high" && !e.dropped, e);
 e = await effortFor("nosupport", {}, { defaultModel: "m-no" });
 check("unsupported model drops the implicit default quietly", e.args.length === 0 && !e.dropped, e);
 e = await effortFor("nosupportexplicit", { effort: "high", model: "m-no" });
@@ -299,6 +309,85 @@ check("unsupported model drops an explicit effort with a message", e.args.length
 e = await effortFor("alias", { reasoningEffort: "low" });
 check("--reasoning-effort is sent once, as --effort", e.args.join(" ") === "--effort low", e);
 delete process.env.GROK_PLUGIN_EFFORT;
+delete process.env.GROK_PLUGIN_MODEL;
+
+console.log("\nmodel");
+{
+  const mod = await import(`${LIB}?model=plain`);
+  check("default model is grok-4.7-build-fast", mod.resolveModel(null) === "grok-4.7-build-fast", mod.resolveModel(null));
+  check("explicit --model wins", mod.resolveModel("grok-4.7") === "grok-4.7", mod.resolveModel("grok-4.7"));
+  check("--model default sends no flag", mod.resolveModel("default") === null, mod.resolveModel("default"));
+  process.env.GROK_PLUGIN_MODEL = "grok-4.6";
+  const envMod = await import(`${LIB}?model=env`);
+  check("GROK_PLUGIN_MODEL sets the default", envMod.resolveModel(null) === "grok-4.6", envMod.resolveModel(null));
+  delete process.env.GROK_PLUGIN_MODEL;
+}
+
+console.log("\nprofiles");
+{
+  const mod = await import(`${LIB}?profile=plain`);
+  const both = (req) => `${mod.resolveModel(req.model, req.profile)} ${mod.effortArgs(req).args.join(" ")}`;
+  check("default profile is fast", both({}) === "grok-4.7-build-fast --effort low", both({}));
+  check("--profile thrifty", both({ profile: "thrifty" }) === "grok-4.7 --effort low", both({ profile: "thrifty" }));
+  check("--profile deep", both({ profile: "deep" }) === "grok-4.7 --effort medium", both({ profile: "deep" }));
+  check("--effort overrides the profile", both({ profile: "deep", effort: "high" }) === "grok-4.7 --effort high", null);
+  check("--model overrides the profile", both({ profile: "deep", model: "m-yes" }) === "m-yes --effort medium", null);
+  check("an unknown profile is an error", (() => { try { mod.resolveProfile("fsat"); return false; } catch (err) { return /Unknown --profile "fsat"/.test(err.message); } })(), null);
+  process.env.GROK_PLUGIN_PROFILE = "deep";
+  check("GROK_PLUGIN_PROFILE sets the default", both({}) === "grok-4.7 --effort medium", both({}));
+  process.env.GROK_PLUGIN_EFFORT = "low";
+  check("GROK_PLUGIN_EFFORT beats GROK_PLUGIN_PROFILE", both({}) === "grok-4.7 --effort low", both({}));
+  check("an explicit --profile beats GROK_PLUGIN_EFFORT", both({ profile: "deep" }) === "grok-4.7 --effort medium", null);
+  process.env.GROK_PLUGIN_PROFILE = "nope";
+  check("an unknown GROK_PLUGIN_PROFILE is an error", (() => { try { mod.resolveProfile(null); return false; } catch (err) { return /GROK_PLUGIN_PROFILE/.test(err.message); } })(), null);
+  delete process.env.GROK_PLUGIN_PROFILE;
+  delete process.env.GROK_PLUGIN_EFFORT;
+}
+
+console.log("\nchild environment");
+r = await runFake(
+  "leanenv",
+  `#!/bin/sh\nprintf '{"type":"text","data":"%s|%s|%s"}\\n{"type":"end","stopReason":"end_turn"}\\n' "$GROK_CLAUDE_SKILLS_ENABLED" "$GROK_CLAUDE_HOOKS_ENABLED" "$GROK_CURSOR_MCPS_ENABLED"\n`,
+);
+check("grok runs with Claude/Cursor skills, hooks and MCP scanning off", r.text === "0|0|0", r.text);
+
+console.log("\ntimeout message");
+{
+  const { timeoutMessage } = await import(LIB);
+  const busy = timeoutMessage(480_000, { toolCalls: 41, lastEventAt: 1_000 }, 13_000);
+  check("a busy run is reported as still working", /still working \(41 tool calls, last activity 12s ago\)/.test(busy), busy);
+  check("a busy run is not called unresponsive", !/no response/.test(busy), busy);
+  const silent = timeoutMessage(480_000, {}, 0);
+  check("a silent run says there was no output", /no output from grok/.test(silent), silent);
+}
+r = await runFake(
+  "busytimeout",
+  `#!/bin/sh\necho '{"type":"tool_call","toolName":"read_file"}'\necho '{"type":"tool_call","toolName":"grep"}'\nexec sleep 30\n`,
+  { timeoutMs: 1_500, graceMs: 500 },
+);
+check("timed-out run counts its tool calls", r.toolCalls === 2 && /2 tool calls/.test(r.errorMessage || ""), r.errorMessage);
+
+console.log("\nrendering an unfinished run");
+{
+  const render = await import(resolve(dirname(LIB), "render.mjs"));
+  const failed = { ok: false, errorMessage: "Timed out", text: "I'll review it.", thought: "a".repeat(5_000) + "FOUND: retryable() misclassifies" };
+  const out = render.renderReviewResult(failed, { targetLabel: "branch" });
+  check("partial text is shown", out.includes("Partial output:\nI'll review it."), out.slice(0, 200));
+  check("the end of grok's reasoning is shown as working notes", out.includes("working notes") && out.includes("FOUND: retryable() misclassifies"), out.slice(-200));
+  check("working notes are bounded", out.length < 4_600, out.length);
+  const ok = render.renderReviewResult({ ok: true, text: "fine", thought: "secret musing" }, {});
+  check("a finished answer never shows reasoning", !ok.includes("secret musing"), ok);
+}
+
+console.log("\nprompts");
+{
+  const git = await import(resolve(dirname(LIB), "git.mjs"));
+  const review = git.buildReviewPrompt("/repo", {}, { content: "Diff:\n```diff\n-a\n+b\n```" });
+  check("review prompt ends with the working method", review.trimEnd().endsWith(git.REVIEW_METHOD), review.slice(-120));
+  check("review method asks for every hunk and its dependents", /every changed hunk/.test(git.REVIEW_METHOD) && /callers/.test(git.REVIEW_METHOD), git.REVIEW_METHOD);
+  const consult = git.buildConsultPrompt({ question: "why?", files: [] });
+  check("consult prompt ends with the consult method", consult.trimEnd().endsWith(git.CONSULT_METHOD), consult);
+}
 
 // -------------------------------------------------------------------- timers
 

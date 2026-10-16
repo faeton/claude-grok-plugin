@@ -55,8 +55,11 @@ This plugin fixes all three:
   success. Just as importantly, a *completed* answer is never thrown away:
   stop-reason matching is case- and separator-insensitive and fails open on
   unrecognized values that carry text, because Grok documents its stop-reason
-  list as non-exhaustive. Truncated answers (`max_tokens`, `max_turn_requests`)
-  are returned with a warning rather than discarded.
+  list as non-exhaustive. An answer cut by the output limit (`max_tokens`) is
+  returned with a warning rather than discarded. A run that stopped before it
+  wrote its answer (`max_turn_requests`, `tool_use`) fails, with its text and
+  the end of its reasoning shown as partial output, so a one-line preamble is
+  never reported as a finished review.
 - **Stall detection.** Runs stream their events, so a stalled relay is caught as
   an absence of output within minutes instead of burning the full watchdog. A
   wall-clock backstop still bounds the worst case. Every way a run can end
@@ -113,35 +116,84 @@ fix if not.
 
 - `--background` — run as a tracked detached job; read it back with
   `/grok:status` / `/grok:result`. (Foreground is the default for small asks.)
-- `--model <id>` — pin a specific Grok model.
+- `--profile fast|thrifty|deep` — model and effort together (see below).
+  **Defaults to `fast`.**
+- `--model <id>` — Grok model; overrides the profile.
 - `--effort <low|medium|high|xhigh|max>` — reasoning effort, on `consult`,
-  `review` and `adversarial-review`. **Defaults to `medium`** (the grok CLI's
-  own default is `high`, which is very slow for routine asks). Automatically
+  `review` and `adversarial-review`; overrides the profile. Automatically
   dropped if the target model doesn't support it (so it never 400s).
 - `--scope auto|working-tree|branch` and `--base <ref>` — for reviews.
-- `--timeout-ms <ms>` — wall-clock backstop (default 15 minutes; must be > 0).
+- `--timeout-ms <ms>` — wall-clock backstop (default 8 minutes, so a
+  foreground run finishes inside Claude Code's 10-minute Bash cap; must be > 0).
 - `--idle-ms <ms>` — kill a run that produces no output at all for this long
   (default 3 minutes). Catches a stalled relay long before the backstop. Don't
   set it much lower: Grok can spend up to 120s draining usage after the answer
   without emitting anything.
 
-### Changing the default effort
+### Profiles
 
-Per call, pass `--effort`, e.g. `/grok:review --effort high`.
+| Profile | Model / effort | Typical review | Use it for |
+|---|---|---|---|
+| **`fast`** (default) | `grok-4.7-build-fast` / `low` | about 1 min | everyday reviews and consults |
+| `thrifty` | `grok-4.7` / `low` | about 2 min | the same findings on about half the allowance |
+| `deep` | `grok-4.7` / `medium` | 4-15 min | a slower, more thorough pass |
 
-To change the default for every call, set `GROK_PLUGIN_EFFORT` in
+`grok-4.7-build-fast` is billed at twice `grok-4.7`'s per-token price, so on a
+subscription `fast` uses the allowance about twice as fast per token as
+`thrifty`. Measured cost on the hard review below: `fast` about $0.10-0.14,
+`thrifty` about $0.05-0.09 (from `grok usage <session-id>`).
+
+Reviews paste the full current text of every changed file into the prompt
+(up to 150 KB in total; lockfiles, minified files and source maps are left
+out), so Grok sees the code around each hunk without paging through it. That
+is what lets `thrifty` find bugs that need the surrounding code. Files that
+don't fit are listed, and Grok can still read them and anything else in the
+repo with its read-only tools. Set `GROK_PLUGIN_INLINE_BYTES` to change the
+budget (`0` turns it off).
+
+### Why these defaults
+
+Measured on identical review prompts against Codex and Claude (grok CLI 1.0.60,
+October 2026), using diffs with planted bugs as an answer key:
+
+| Grok config | Seeded review | Hard review (cross-file bug) | Real 16 KB consult |
+|---|---|---|---|
+| `grok-4.7` / `medium` (old default) | 304 s, 40 tool calls | 3/3 bugs, 254 s | 915 s (past the old 15-min timeout in practice) |
+| `grok-4.7` / `low` | 124 s | 2/3 bugs (misses the cross-file one every run) | 512 s |
+| `grok-4.7` / `low` + full changed files | - | 3/3 bugs, 96-155 s | - |
+| **`grok-4.7-build-fast` / `low`** (+ lean context, working-method prompt) | **49-62 s** | **3/3 bugs, 54-63 s** | **232 s** |
+
+For comparison, Codex took 31-74 s and Opus 57-78 s on the hard review. Every
+config found all four bugs in the easier seeded review, so grok-4.7 at medium
+was spending its extra time without finding more. A timed-out run used to
+report "no response from grok" and keep one preamble sentence; it now says
+what grok was doing and shows the end of its reasoning as working notes.
+
+A second machine (macOS, a different network and continent) gave the same
+token counts and throughput, and the grok.com web app took 126 s on the same
+diff prompt. The time is the model's reasoning, not the network or the CLI.
+
+### Changing the defaults
+
+Per call, pass `--profile`, or `--model` / `--effort`, e.g.
+`/grok:review --profile deep` or `/grok:review --model grok-4.7 --effort high`.
+
+To change the default for every call, set `GROK_PLUGIN_PROFILE` (or
+`GROK_PLUGIN_MODEL` / `GROK_PLUGIN_EFFORT`, which override it) in
 `~/.claude/settings.json` (or a project's `.claude/settings.json`) and restart
 Claude Code:
 
 ```json
 {
   "env": {
-    "GROK_PLUGIN_EFFORT": "high"
+    "GROK_PLUGIN_PROFILE": "thrifty"
   }
 }
 ```
 
-Use `"default"` to send no effort flag and let the grok CLI decide.
+Precedence: `--model` / `--effort`, then `--profile`, then `GROK_PLUGIN_MODEL` /
+`GROK_PLUGIN_EFFORT`, then `GROK_PLUGIN_PROFILE`, then `fast`. Use `"default"`
+for the model or effort to send no flag and let the grok CLI decide.
 
 ### Examples
 
@@ -157,6 +209,9 @@ Use `"default"` to send no effort flag and let the grok CLI decide.
 
 # Review a branch against main, in the background
 /grok:review --scope branch --base origin/main --background
+
+# Slower, deeper review
+/grok:review --profile deep --background
 /grok:status            # find the job id
 /grok:result <job-id>   # read the findings
 
@@ -191,7 +246,7 @@ scripts/
 Run the test suite with:
 
 ```text
-node --test plugins/grok/scripts/test/
+node --test plugins/grok/scripts/test/*.test.mjs
 ```
 
 `runner.test.mjs` replays Grok's real streaming wire format through a stub

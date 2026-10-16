@@ -11,16 +11,34 @@ function elapsed(job) {
   return `${Math.floor(s / 60)}m${s % 60}s`;
 }
 
+// The tail of grok's reasoning stream, for a run that ended without an answer.
+// It is the only record of what an unfinished run had found (a timed-out review
+// had its whole investigation there, and only a one-line preamble as text). The
+// head is mostly orientation, so the end is kept.
+export function reasoningTail(thought, max = 4_000) {
+  const t = String(thought ?? "").trim();
+  if (!t) return "";
+  return t.length <= max ? t : "…" + t.slice(t.length - max);
+}
+
+function renderFailure(headline, result) {
+  const lines = [headline];
+  if (result.errorMessage) lines.push(result.errorMessage);
+  if (result.stopReason) lines.push(`stopReason: ${result.stopReason}`);
+  if (result.text) lines.push("", "Partial output:", result.text.trim());
+  const notes = reasoningTail(result.thought);
+  if (notes) {
+    lines.push("", "Grok's working notes when it stopped (unfinished reasoning, unverified):", notes);
+  }
+  return lines.join("\n") + "\n";
+}
+
 export function renderConsultResult(result) {
   if (result.ok) {
     const head = result.warning ? `[grok] ${result.warning}\n\n` : "";
     return head + result.text.trimEnd() + "\n";
   }
-  const lines = ["[grok] Consultation did not complete."];
-  if (result.errorMessage) lines.push(result.errorMessage);
-  if (result.stopReason) lines.push(`stopReason: ${result.stopReason}`);
-  if (result.text) lines.push("", "Partial output:", result.text.trim());
-  return lines.join("\n") + "\n";
+  return renderFailure("[grok] Consultation did not complete.", result);
 }
 
 export function renderReviewResult(result, { targetLabel } = {}) {
@@ -29,11 +47,7 @@ export function renderReviewResult(result, { targetLabel } = {}) {
     const warn = result.warning ? `[grok] ${result.warning}\n\n` : "";
     return head + warn + result.text.trimEnd() + "\n";
   }
-  const lines = ["[grok] Review did not complete."];
-  if (result.errorMessage) lines.push(result.errorMessage);
-  if (result.stopReason) lines.push(`stopReason: ${result.stopReason}`);
-  if (result.text) lines.push("", "Partial output:", result.text.trim());
-  return lines.join("\n") + "\n";
+  return renderFailure("[grok] Review did not complete.", result);
 }
 
 export function renderQueuedLaunch(job) {

@@ -121,6 +121,35 @@ check(
   null,
 );
 
+// Full text of changed files.
+const full = makeRepo("full");
+mkdirSync(join(full, "src"));
+writeFileSync(join(full, "src", "lib.py"), "def f():\n    return 1\n\n\ndef g():\n    return 2  # untouched context\n");
+writeFileSync(join(full, "package-lock.json"), "{}\n");
+writeFileSync(join(full, "huge.txt"), "y\n".repeat(100_000));
+writeFileSync(join(full, "fenced.md"), "text\n```\ncode\n```\n");
+g(full, "add", ".");
+g(full, "commit", "-q", "-m", "files");
+writeFileSync(join(full, "src", "lib.py"), "def f():\n    return 3\n\n\ndef g():\n    return 2  # untouched context\n");
+writeFileSync(join(full, "package-lock.json"), '{"x":1}\n');
+writeFileSync(join(full, "huge.txt"), "z\n".repeat(100_000));
+writeFileSync(join(full, "fenced.md"), "text\n```\ncode2\n```\n");
+ctx = collectReviewContext(join(full, "src"), { mode: "working-tree" });
+check("a changed file's untouched code is inlined", ctx.content.includes("# untouched context"), null);
+check("inlined from a subdirectory cwd", ctx.content.includes("--- src/lib.py ---"), null);
+check("lockfiles are listed, not inlined", /package-lock\.json \(lockfile/.test(ctx.content) && !ctx.content.includes("--- package-lock.json ---"), null);
+check("a file over the budget is listed, not inlined", /huge\.txt \(\d+ bytes, over the inline budget\)/.test(ctx.content), null);
+check("a file containing ``` gets a longer fence", ctx.content.includes("````\ntext\n```\ncode2"), null);
+g(full, "checkout", "-q", "-b", "feature");
+g(full, "commit", "-qam", "change");
+writeFileSync(join(full, "src", "lib.py"), "uncommitted\n");
+ctx = collectReviewContext(full, { mode: "branch", baseRef: "main" });
+check("a branch review inlines files as of HEAD", ctx.content.includes("return 3") && !ctx.content.includes("uncommitted"), null);
+process.env.GROK_PLUGIN_INLINE_BYTES = "0";
+ctx = collectReviewContext(full, { mode: "branch", baseRef: "main" });
+check("GROK_PLUGIN_INLINE_BYTES=0 turns inlining off", !ctx.content.includes("Full current text"), null);
+delete process.env.GROK_PLUGIN_INLINE_BYTES;
+
 const big = makeRepo("big");
 writeFileSync(join(big, "a.txt"), "x".repeat(2_500_000) + "\n");
 check(
