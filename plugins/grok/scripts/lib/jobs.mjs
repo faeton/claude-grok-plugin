@@ -1,18 +1,35 @@
 // Job lifecycle: create, run-with-tracking, snapshot, resolve for status/result/cancel.
+//
+// Every state change is a guarded transition through updateJob(): it re-reads
+// the job under the workspace lock and only applies when the job is still in an
+// allowed source status. That is what keeps the state machine one-way:
+//
+//   queued ──▶ running ──▶ completed | failed
+//      │          │
+//      └──────────┴──────▶ cancelled | failed (orphaned)
+//
+// Terminal states never change again, so a late or stale writer (a slow
+// launcher, a cancel racing a finish, a reconcile reading an old index row)
+// becomes a no-op instead of rolling a finished job backwards.
 
 import { appendFileSync, writeFileSync } from "node:fs";
 import {
   generateJobId,
-  jobFilePath,
   logFilePath,
   readJobFile,
-  writeJobFile,
-  upsertJob,
+  updateJob,
   listJobs,
   pidAlive,
 } from "./state.mjs";
 
 export const SESSION_ID_ENV = "GROK_COMPANION_SESSION_ID";
+
+export const ACTIVE_STATUSES = new Set(["queued", "running"]);
+export const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+
+// A queued job has no worker pid until launchWorker records one, so "no pid"
+// only means "dead" once the job has had time to start.
+export const START_GRACE_MS = 30_000;
 
 export function nowIso() {
   return new Date().toISOString();
@@ -41,6 +58,17 @@ export function appendLogBlock(logFile, title, body) {
   }
 }
 
+// Apply `patch` (an object, or a fn of the current record) only while the job's
+// status is one of `from`. Returns { job, changed }.
+export function transition(workspaceRoot, jobId, from, patch) {
+  const allowed = new Set(from);
+  return updateJob(workspaceRoot, jobId, (current) => {
+    if (!current || !allowed.has(current.status)) return null;
+    const delta = typeof patch === "function" ? patch(current) : patch;
+    return delta ? { ...current, ...delta } : null;
+  });
+}
+
 export function createJob({ workspaceRoot, kind, kindLabel, title, summary, prefix, request }) {
   const id = generateJobId(prefix ?? "grok");
   const sessionId = currentSessionId();
@@ -57,50 +85,48 @@ export function createJob({ workspaceRoot, kind, kindLabel, title, summary, pref
     workspaceRoot,
     logFile,
     pid: null,
+    grokPid: null,
     request: request ?? null,
     createdAt: nowIso(),
     ...(sessionId ? { sessionId } : {}),
   };
-  writeJobFile(workspaceRoot, id, record);
-  upsertJob(workspaceRoot, record);
-  return record;
+  return updateJob(workspaceRoot, id, () => record).job;
 }
 
 // Run `runner` (an async fn returning an execution result) while keeping the job
 // file + index in sync. The runner result shape:
 //   { ok, exitCode, payload, rendered, summary, stopReason }
+//
+// Returns null without running when the job is no longer queued (e.g. it was
+// cancelled before its worker got going).
 export async function runTrackedJob(job, runner, { onProgress } = {}) {
-  const running = {
-    ...job,
+  const { workspaceRoot, id } = job;
+  const started = transition(workspaceRoot, id, ["queued"], {
     status: "running",
     phase: "running",
     pid: process.pid,
     startedAt: nowIso(),
-  };
-  writeJobFile(job.workspaceRoot, job.id, running);
-  upsertJob(job.workspaceRoot, running);
-  appendLog(job.logFile, `Running ${job.title}.`);
+  });
+  if (!started.changed) return null;
+  const running = started.job;
+  appendLog(running.logFile, `Running ${running.title}.`);
 
   try {
     const execution = await runner((event) => {
-      if (event?.phase) {
-        upsertJob(job.workspaceRoot, { id: job.id, phase: event.phase });
-      }
-      if (event?.grokPid) {
-        upsertJob(job.workspaceRoot, { id: job.id, grokPid: event.grokPid });
-      }
-      if (event?.message) appendLog(job.logFile, event.message);
+      const patch = {};
+      if (event?.phase) patch.phase = event.phase;
+      if (event?.grokPid) patch.grokPid = event.grokPid;
+      if (Object.keys(patch).length) transition(workspaceRoot, id, ["running"], patch);
+      if (event?.message) appendLog(running.logFile, event.message);
       onProgress?.(event);
     });
 
-    const status = execution.ok ? "completed" : "failed";
-    const completedAt = nowIso();
-    const stored = {
-      ...running,
-      status,
+    const finished = transition(workspaceRoot, id, ["running"], {
+      status: execution.ok ? "completed" : "failed",
       phase: execution.ok ? "done" : "failed",
       pid: null,
-      completedAt,
+      grokPid: null,
+      completedAt: nowIso(),
       stopReason: execution.stopReason ?? null,
       // Persisted so timeouts can be counted directly instead of being inferred
       // from durationMs or the error string (which silently conflates runs that
@@ -114,26 +140,30 @@ export async function runTrackedJob(job, runner, { onProgress } = {}) {
       errorMessage: execution.ok ? null : execution.errorMessage ?? "Run failed.",
       result: execution.payload,
       rendered: execution.rendered,
-    };
-    writeJobFile(job.workspaceRoot, job.id, stored);
-    upsertJob(job.workspaceRoot, stored);
-    appendLogBlock(job.logFile, "Final output", execution.rendered);
+    });
+    if (!finished.changed) {
+      // Cancelled while grok was running. Keep the cancellation, but hold on to
+      // any answer text that arrived so /grok:result can still show it. The
+      // "exited with code 143" failure caused by the cancel itself is not kept.
+      transition(workspaceRoot, id, ["cancelled"], (current) =>
+        current.rendered || !execution.payload?.text
+          ? null
+          : { result: execution.payload, rendered: execution.rendered },
+      );
+    }
+    appendLogBlock(running.logFile, "Final output", execution.rendered);
     return execution;
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    const existing = readJobFile(job.workspaceRoot, job.id) ?? running;
-    const completedAt = nowIso();
-    const stored = {
-      ...existing,
+    transition(workspaceRoot, id, ["running"], {
       status: "failed",
       phase: "failed",
       pid: null,
-      completedAt,
+      grokPid: null,
+      completedAt: nowIso(),
       errorMessage: message,
-    };
-    writeJobFile(job.workspaceRoot, job.id, stored);
-    upsertJob(job.workspaceRoot, stored);
-    appendLog(job.logFile, `Failed: ${message}`);
+    });
+    appendLog(running.logFile, `Failed: ${message}`);
     throw error;
   }
 }
@@ -146,25 +176,41 @@ export function sortJobsNewestFirst(jobs) {
   });
 }
 
-// Reconcile a job marked running/queued whose worker pid is dead: persist it as
-// failed/orphaned so status, result, and the index all agree. Without the
-// persist, `status` would show failed (in-memory) while `result` re-read the
-// stale running record and claimed "no output yet".
+// Is this active job's worker gone? Decided from the job FILE, never the index:
+// the index can lag (it is the summary), and acting on a lagging row is how a
+// just-finished job used to get relabelled as orphaned.
+function workerIsDead(job, now = Date.now()) {
+  if (Number.isInteger(job.pid)) return !pidAlive(job.pid);
+  const created = Date.parse(job.createdAt ?? "") || 0;
+  return now - created > START_GRACE_MS;
+}
+
+// Reconcile a queued/running job whose worker is dead: persist it as
+// failed/orphaned so status, result, and the index all agree. Also repairs an
+// index row that lags the job file. Returns the up-to-date record.
 export function reconcile(workspaceRoot, job) {
-  if ((job.status === "running" || job.status === "queued") && !pidAlive(job.pid)) {
-    const failed = {
-      ...(readJobFile(workspaceRoot, job.id) ?? job),
-      status: "failed",
-      phase: "orphaned",
-      pid: null,
-      completedAt: job.completedAt ?? nowIso(),
-      errorMessage: job.errorMessage ?? "Worker process exited without finishing.",
-    };
-    writeJobFile(workspaceRoot, job.id, failed);
-    upsertJob(workspaceRoot, failed);
-    return failed;
+  const { job: current } = transition(
+    workspaceRoot,
+    job.id,
+    ["queued", "running"],
+    (latest) =>
+      workerIsDead(latest)
+        ? {
+            status: "failed",
+            phase: "orphaned",
+            pid: null,
+            grokPid: null,
+            completedAt: latest.completedAt ?? nowIso(),
+            errorMessage: latest.errorMessage ?? "Worker process exited without finishing.",
+          }
+        : null,
+  );
+  if (!current) return job; // no job file at all: nothing better to show
+  if (current.status !== job.status) {
+    // The index row was stale (e.g. a lost update). Rewrite it from the file.
+    updateJob(workspaceRoot, job.id, (latest) => latest);
   }
-  return job;
+  return current;
 }
 
 export function resolveJob(workspaceRoot, reference) {

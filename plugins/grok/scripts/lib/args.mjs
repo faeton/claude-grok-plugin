@@ -7,12 +7,18 @@
 // Usage:
 //   parseArgs(argv, {
 //     valueOptions: ["model", "base"],   // consume the next token as the value
-//     booleanOptions: ["json", "wait"],  // presence-only
+//     booleanOptions: ["json", "wait"],  // presence-only; --x=true / --x=false
 //     repeatable: ["file"],              // collect into an array (implies value)
 //     aliasMap: { m: "model" },
 //   })
 //
 // Returns { options, positionals }. Repeatable options are always arrays.
+//
+// Strict on purpose. An unknown flag is an error rather than a silent `true`
+// (a typo like --scpoe used to be ignored), `--background=false` means false
+// rather than the truthy string "false", and a value flag never swallows the
+// next flag as its value (`--file --model x` attached a file named --model).
+// A value that really starts with "-" can still be passed as --flag=-value.
 
 export function parseArgs(argv, config = {}) {
   const valueOptions = new Set(config.valueOptions ?? []);
@@ -34,6 +40,13 @@ export function parseArgs(argv, config = {}) {
       options[key] = value;
     }
   };
+  const takeValue = (flag, key, i) => {
+    const next = argv[i + 1];
+    if (next === undefined || (next.startsWith("-") && next.length > 1 && !/^-\d/.test(next))) {
+      throw new Error(`Flag ${flag} expects a value.`);
+    }
+    assign(key, next);
+  };
 
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
@@ -43,43 +56,36 @@ export function parseArgs(argv, config = {}) {
       break;
     }
 
-    if (token.startsWith("--") && token.length > 2) {
-      const body = token.slice(2);
-      const eq = body.indexOf("=");
-      if (eq !== -1) {
-        assign(resolveKey(body.slice(0, eq)), body.slice(eq + 1));
-        continue;
-      }
-      const key = resolveKey(body);
-      if (valueOptions.has(key)) {
-        const next = argv[i + 1];
-        if (next === undefined) {
-          throw new Error(`Flag --${key} expects a value.`);
-        }
-        assign(key, next);
-        i++;
-      } else {
-        options[key] = true;
-      }
+    const long = token.startsWith("--") && token.length > 2;
+    const short = !long && token.startsWith("-") && token.length > 1 && !/^-\d/.test(token);
+    if (!long && !short) {
+      positionals.push(token);
       continue;
     }
 
-    if (token.startsWith("-") && token.length > 1 && !/^-\d/.test(token)) {
-      const key = resolveKey(token.slice(1));
-      if (valueOptions.has(key)) {
-        const next = argv[i + 1];
-        if (next === undefined) {
-          throw new Error(`Flag -${token.slice(1)} expects a value.`);
-        }
-        assign(key, next);
-        i++;
-      } else {
-        options[key] = true;
-      }
-      continue;
-    }
+    const body = token.slice(long ? 2 : 1);
+    const eq = long ? body.indexOf("=") : -1;
+    const key = resolveKey(eq === -1 ? body : body.slice(0, eq));
+    const flag = `${long ? "--" : "-"}${eq === -1 ? body : body.slice(0, eq)}`;
 
-    positionals.push(token);
+    if (valueOptions.has(key)) {
+      if (eq !== -1) assign(key, body.slice(eq + 1));
+      else {
+        takeValue(flag, key, i);
+        i++;
+      }
+    } else if (booleanOptions.has(key)) {
+      if (eq === -1) options[key] = true;
+      else {
+        const raw = body.slice(eq + 1).toLowerCase();
+        if (raw !== "true" && raw !== "false") {
+          throw new Error(`Flag ${flag} is a switch; use ${flag}, ${flag}=true or ${flag}=false.`);
+        }
+        options[key] = raw === "true";
+      }
+    } else {
+      throw new Error(`Unknown flag ${flag}.`);
+    }
   }
 
   return { options, positionals };

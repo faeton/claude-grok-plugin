@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Tests for the grok runner: stop-reason classification, streaming-json parsing,
-// and the idle / wall-clock watchdogs.
+// the idle / wall-clock watchdogs, process-group teardown, the read-only argv,
+// and effort selection.
 //
 // No dependencies and no network: a shell script stands in for the `grok` binary
 // via GROK_BIN, so the real wire format can be replayed deterministically.
@@ -11,7 +12,8 @@
 // every successful consult report as a relay cancellation while the full answer
 // sat in `result.text`. Anything that decides ok/not-ok belongs under test.
 
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -66,6 +68,8 @@ for (const [reason, text, expected, label] of [
   ["MaxTurns", TEXT, true, "MaxTurns kept as truncated"],
   ["max_tokens", "", false, "truncated with no text fails"],
   ["a_future_reason", TEXT, true, "unknown reason with text fails OPEN"],
+  ["tool_use", TEXT, true, "tool_use turn kept as truncated"],
+  ["pause_turn", "", false, "pause_turn with no text fails"],
   ["a_future_reason", "hi", false, "unknown reason without real text fails"],
 ]) {
   const verdict = classifyStopReason(reason, text);
@@ -108,7 +112,32 @@ check("cancelled turn keeps its partial text", r.text === "partial work", r.text
 
 r = await runFake("noend", emit([{ type: "text", data: "half an answer" }]));
 check("missing `end` still yields the text", r.text === "half an answer", r.text);
-check("missing `end` warns about truncation", /truncat/i.test(r.warning || ""), r);
+check("missing `end` is a failure, not a completed answer", r.ok === false, r);
+check("missing `end` says the answer is incomplete", /incomplete/.test(r.errorMessage || ""), r.errorMessage);
+
+r = await runFake(
+  "errafter",
+  emit([{ type: "text", data: "some commentary" }, { type: "error", message: "backend exploded" }]),
+);
+check("error event after text still fails", r.ok === false, r);
+check("error event after text keeps the message", /backend exploded/.test(r.errorMessage || ""), r.errorMessage);
+check("error event after text keeps the partial text", r.text === "some commentary", r.text);
+
+r = await runFake(
+  "errthenend",
+  emit([
+    { type: "error", message: "transient" },
+    { type: "text", data: "recovered answer" },
+    { type: "end", stopReason: "end_turn" },
+  ]),
+);
+check("a later `end` overrides an earlier error event", r.ok === true, r);
+
+r = await runFake(
+  "tooluse",
+  emit([{ type: "text", data: "partial analysis so far" }, { type: "end", stopReason: "tool_use" }]),
+);
+check("turn ending on tool_use is flagged as truncated", r.ok === true && /truncated/.test(r.warning || ""), r);
 
 r = await runFake(
   "errorevent",
@@ -152,6 +181,110 @@ check(
   seen,
 );
 
+// --------------------------------------------------------------- prompt file
+
+console.log("\nprompt delivery");
+
+// The fake grok prints the --prompt-file it was given, plus that path.
+r = await runFake(
+  "promptfile",
+  `#!/bin/sh\nwhile [ "$1" != "--prompt-file" ]; do shift; done\n` +
+    `printf '{"type":"text","data":"%s|%s"}\\n' "$(cat "$2")" "$2"\n` +
+    `printf '{"type":"end","stopReason":"end_turn"}\\n'\n`,
+  { prompt: "the prompt body" },
+);
+const [body, promptPath] = r.text.split("|");
+check("prompt arrives via --prompt-file", body === "the prompt body", r.text);
+check("prompt file is removed afterwards", promptPath && !existsSync(promptPath), promptPath);
+
+// A 1MB prompt would be E2BIG as a -p argument.
+r = await runFake(
+  "bigprompt",
+  `#!/bin/sh\nwhile [ "$1" != "--prompt-file" ]; do shift; done\n` +
+    `printf '{"type":"text","data":"%s"}\\n' "$(wc -c < "$2" | tr -d ' ')"\n` +
+    `printf '{"type":"end","stopReason":"end_turn"}\\n'\n`,
+  { prompt: "y".repeat(1_000_000) },
+);
+check("prompt larger than ARG_MAX is delivered", r.ok && r.text === "1000000", r.text);
+
+// ------------------------------------------------------------------- sandbox
+
+console.log("\nsandbox");
+
+r = await runFake(
+  "nosandbox",
+  `#!/bin/sh\necho "warning: sandbox could not be applied: unsupported kernel" >&2\n` +
+    `sleep 0.5\nprintf '{"type":"text","data":"ran unsandboxed"}\\n'\n` +
+    `printf '{"type":"end","stopReason":"end_turn"}\\n'\nsleep 30\n`,
+  { timeoutMs: 25_000, graceMs: 500 },
+);
+check("sandbox failure stops the run", r.ok === false && r.sandboxFailed === true, r);
+check("sandbox failure is named", /sandbox/.test(r.errorMessage || ""), r.errorMessage);
+check("sandbox failure is caught before the answer", !r.text.includes("ran unsandboxed"), r.text);
+
+const { readOnlyArgs } = await import(LIB);
+const consultArgs = readOnlyArgs({ web: true });
+const reviewArgs = readOnlyArgs({ web: false });
+const valueOf = (args, flag) => args[args.indexOf(flag) + 1];
+check(
+  "consult allowlists read + web tools only",
+  valueOf(consultArgs, "--tools") === "read_file,grep,list_dir,web_search,web_fetch",
+  valueOf(consultArgs, "--tools"),
+);
+check("review allowlists read tools only", valueOf(reviewArgs, "--tools") === "read_file,grep,list_dir", reviewArgs);
+check("read-only sandbox requested", valueOf(reviewArgs, "--sandbox") === "read-only", reviewArgs);
+check("unapproved tools are refused", valueOf(reviewArgs, "--permission-mode") === "dontAsk", reviewArgs);
+check(
+  "MCP meta-tools and `write` are removed",
+  ["search_tool", "use_tool", "write", "Agent"].every((t) => valueOf(reviewArgs, "--disallowed-tools").split(",").includes(t)),
+  valueOf(reviewArgs, "--disallowed-tools"),
+);
+check("MCP calls are denied", reviewArgs.join(" ").includes("--deny MCPTool"), reviewArgs);
+
+// -------------------------------------------------------------------- effort
+
+console.log("\neffort");
+
+const home = join(DIR, "grokhome");
+mkdirSync(home);
+writeFileSync(
+  join(home, "models_cache.json"),
+  JSON.stringify({
+    models: {
+      "m-yes": { info: { supports_reasoning_effort: true } },
+      "m-no": { info: { supports_reasoning_effort: false } },
+    },
+  }),
+);
+async function effortFor(name, req, env = {}) {
+  const fakeModels = join(DIR, `${name}-models.sh`);
+  writeFileSync(fakeModels, `#!/bin/sh\necho "Default model: ${env.defaultModel ?? "m-yes"}"\n`);
+  chmodSync(fakeModels, 0o755);
+  process.env.GROK_BIN = fakeModels;
+  process.env.GROK_HOME = home;
+  if (env.effort === undefined) delete process.env.GROK_PLUGIN_EFFORT;
+  else process.env.GROK_PLUGIN_EFFORT = env.effort;
+  const mod = await import(`${LIB}?effort=${name}`);
+  return mod.effortArgs(req);
+}
+let e = await effortFor("default", {});
+check("default effort is medium", e.args.join(" ") === "--effort medium", e);
+e = await effortFor("explicit", { effort: "high" });
+check("explicit effort wins", e.args.join(" ") === "--effort high", e);
+e = await effortFor("envset", {}, { effort: "low" });
+check("GROK_PLUGIN_EFFORT sets the default", e.args.join(" ") === "--effort low", e);
+e = await effortFor("envdefault", {}, { effort: "default" });
+check("GROK_PLUGIN_EFFORT=default sends no flag", e.args.length === 0 && !e.dropped, e);
+e = await effortFor("unknown", {}, { defaultModel: "m-uncached" });
+check("unknown support still sends the default", e.args.join(" ") === "--effort medium", e);
+e = await effortFor("nosupport", {}, { defaultModel: "m-no" });
+check("unsupported model drops the implicit default quietly", e.args.length === 0 && !e.dropped, e);
+e = await effortFor("nosupportexplicit", { effort: "high", model: "m-no" });
+check("unsupported model drops an explicit effort with a message", e.args.length === 0 && Boolean(e.dropped), e);
+e = await effortFor("alias", { reasoningEffort: "low" });
+check("--reasoning-effort is sent once, as --effort", e.args.join(" ") === "--effort low", e);
+delete process.env.GROK_PLUGIN_EFFORT;
+
 // -------------------------------------------------------------------- timers
 
 console.log("\nwatchdogs");
@@ -174,10 +307,42 @@ r = await runFake(
   "hangafterend",
   `#!/bin/sh\nprintf '{"type":"text","data":"complete answer"}\\n'\n` +
     `printf '{"type":"end","stopReason":"end_turn"}\\n'\nsleep 30\n`,
-  { timeoutMs: 25_000, idleMs: 1_200 },
+  // Idle must outlast a slow shell start under load, or it fires before the
+  // answer is printed and the test flakes.
+  { timeoutMs: 25_000, idleMs: 3_000 },
 );
 check("completed answer survives a post-answer hang", r.ok === true, r);
 check("completed-then-killed run is flagged", Boolean(r.warning), r.warning);
+
+// A descendant that ignores SIGTERM and drops the pipes must still be SIGKILLed,
+// even when the companion exits as soon as runGrok resolves. Runs in a separate
+// node process because the bug was the parent exiting before escalation fired.
+const pidFile = join(DIR, "stubborn.pid");
+const stubborn = join(DIR, "stubborn.sh");
+writeFileSync(
+  stubborn,
+  `#!/bin/sh\n( trap '' TERM; exec sh -c 'trap "" TERM; echo $$ > ${pidFile}; while :; do sleep 1; done' ) >/dev/null 2>&1 &\n` +
+    `sleep 30\n`,
+);
+chmodSync(stubborn, 0o755);
+const driver = join(DIR, "driver.mjs");
+writeFileSync(
+  driver,
+  `process.env.GROK_BIN = ${JSON.stringify(stubborn)};\n` +
+    `const { runGrok } = await import(${JSON.stringify(LIB)});\n` +
+    `await runGrok([], { timeoutMs: 800, idleMs: 0, graceMs: 700 });\n`,
+);
+spawnSync(process.execPath, [driver], { timeout: 20_000 });
+const stubbornPid = Number(readFileSync(pidFile, "utf8").trim());
+await new Promise((r) => setTimeout(r, 200));
+let survived = true;
+try {
+  process.kill(stubbornPid, 0);
+} catch {
+  survived = false;
+}
+if (survived) process.kill(stubbornPid, "SIGKILL");
+check("SIGTERM-ignoring descendant is killed before the companion exits", !survived, stubbornPid);
 
 // ---------------------------------------------------------------------------
 

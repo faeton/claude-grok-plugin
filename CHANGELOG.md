@@ -4,6 +4,100 @@ All notable changes to this plugin are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-10-16
+
+Fixes from a whole-codebase review by Codex and Grok, plus a faster default.
+
+### Security
+
+- **Read-only is now an allowlist plus an OS sandbox.** The `--disallowed-tools`
+  denylist had gone stale: grok 1.0.50 names its file-writing tool `write` (not
+  `write_file`), and also exposed scheduler, workflow, monitor, image and MCP
+  meta-tools (`search_tool` / `use_tool`). Only the `--deny Write` permission
+  rule stood between Grok and your files. Every run now passes `--tools` with
+  only `read_file,grep,list_dir` (plus `web_search,web_fetch` for consult),
+  keeps the removal list as a backstop, adds `--deny MCPTool`, uses
+  `--permission-mode dontAsk` so anything needing approval is refused, and runs
+  under `--sandbox read-only`. grok only *warns* when a sandbox cannot be applied
+  and then runs unsandboxed, so the companion now treats that warning as fatal.
+  Verified against grok 1.0.50 via its `available_commands` event.
+- **Untracked symlinks are no longer followed.** A working-tree review read
+  every untracked path with `readFileSync`, so an untracked link to, say,
+  `~/.ssh/id_rsa` sent the key to the model. Symlinks are now listed with their
+  target and never read; non-regular files are skipped; sizes are checked before
+  reading.
+- **`--base` can no longer inject git options.** `--base=--output=/path` was
+  passed to `git diff` as an option and made git write a file. Bases starting
+  with `-` are rejected, must name a commit, and are passed after
+  `--end-of-options`.
+- **Slash-command arguments are no longer spliced into shell commands.**
+  Unquoted `$ARGUMENTS` let `$(...)`, backticks or `;` in a question run in the
+  shell. Commands now pass arguments as one single-quoted word.
+
+### Fixed
+
+- **Processes are no longer orphaned.** The SIGKILL escalation timer was
+  unref'd, so the companion exited before it fired and a descendant that ignored
+  SIGTERM survived. Foreground runs had no signal handler at all, so Ctrl-C left
+  grok running, and cancel sent SIGTERM only. Every path now goes through one
+  teardown: SIGTERM the group, wait, SIGKILL, and only then exit.
+- **Job state can no longer roll back or be clobbered.** All job writes go
+  through a guarded transition under one workspace lock, applied to the
+  re-read current record. Terminal states are final. Previously:
+  - a stale launcher write could reset a finished job to `queued`, and it was
+    then reported as orphaned;
+  - `/grok:cancel` with no id rewrote the newest job, even a completed one, as
+    `cancelled` and hid its output;
+  - a queued job with no pid yet was declared dead by a concurrent `status`;
+  - `reconcile` trusted a lagging index row over the job file.
+- **The state lock never runs unlocked.** After about 1s of contention it used
+  to proceed without the lock. It now waits up to 5s and then fails. Stale locks
+  are detected by a dead owner pid and reclaimed atomically.
+- **Cancel won't signal a reused pid.** Stored pids are checked against `ps`
+  before signalling, and `grokPid` is now persisted on the job file.
+- **Large reviews don't silently lose content.** git output over 1MB was cut
+  off and reviewed as if complete, and prompts over the OS argument limit
+  failed with E2BIG. Prompts now go through `--prompt-file`, git gets a 64MB
+  buffer, and a diff over 2MB fails with a clear message instead of being
+  reviewed in part.
+- **Untracked files with spaces or non-ASCII names are included.** `git
+  ls-files` quoted those names, and the quoted string was used as a path and
+  silently skipped. It now uses `-z`.
+- **git failures are errors, not "No changes detected".**
+- **A cut stream or an error event is now a failure.** Exit 0 with text but no
+  `end` event was stored as a completed job, and an `error` event was ignored
+  whenever some text had arrived. Both now fail, with the partial text kept.
+  A turn that ends on `tool_use` / `pause_turn` is flagged as truncated.
+- **Argument parsing is strict.** `--background=false` used to mean true, a
+  value flag could swallow the next flag, unknown flags and `--scope` typos
+  were silently ignored, `--timeout-ms -1` killed the run instantly and
+  `--timeout-ms 0` meant 15 minutes. All of these are now errors.
+- The companion log moved from `plugins/grok/logs/` (inside the repo when run
+  from a checkout) to `~/.grok/companion/companion.jsonl`.
+- `idledOut` now appears in the job index; usage text, skill and command docs
+  match the code.
+
+### Changed
+
+- **Reasoning effort now defaults to `medium`.** No effort flag was sent
+  before, so every run used the grok CLI's default of `high`, which made
+  consults and reviews very slow. In one whole-repo review, `high` hit the
+  15-minute timeout without answering and `medium` finished in about 10
+  minutes. Override per call with `--effort`, or globally with the
+  `GROK_PLUGIN_EFFORT` env var (`default` = send no flag). The flag is dropped
+  only when grok's model cache says the model lacks effort support; unknown
+  support still sends it. The `grok models` probe now has a 10s timeout.
+- `/grok:cancel` on a job that already finished is a no-op and says so.
+- `/grok:result` shows output a cancelled job produced before it was cancelled.
+
+### Added
+
+- `--effort` / `--reasoning-effort` on `review` and `adversarial-review`.
+- `test/state.test.mjs`: argument parsing, review-context collection in
+  throwaway repos, and the job state machine. The runner tests now cover
+  process-group teardown (verified to fail on the old code), the sandbox
+  failure path, prompt files, the read-only argv and effort selection.
+
 ## [0.4.0] — 2026-08-15
 
 ### Added

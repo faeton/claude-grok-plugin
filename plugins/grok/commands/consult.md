@@ -22,15 +22,17 @@ Execution mode:
 - If it includes `--background`, pass `--background` to the companion (the companion detaches its own worker; you do NOT need Claude's `run_in_background`).
 - Otherwise default to foreground.
 
+Shell quoting (required): pass the raw arguments to the companion as ONE single-quoted shell word, written in place of `'<raw arguments>'` below. Escape every `'` inside them as `'\''`. Never paste the arguments unquoted or inside double quotes — `$(...)`, backticks, `;` and globs in a question or focus text would be run by the shell. The companion splits that single word into flags itself.
+
 Foreground:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" consult $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" consult '<raw arguments>'
 ```
 Return the command stdout verbatim.
 
 Background:
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" consult --background $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" consult '--background <raw arguments>'
 ```
 Then tell the user to check `/grok:status <id>` and `/grok:result <id>`.
 

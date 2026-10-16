@@ -2,11 +2,11 @@
 // Companion for driving the local `grok` CLI from a Claude Code plugin.
 //
 // Grok is used STRICTLY READ-ONLY here: consult and review are second-opinion
-// tools, never agents. Every grok invocation removes the mutating tools by their
-// grok-internal ids (run_terminal_cmd/search_replace/write_file/... plus Agent)
-// AND denies them by Claude-style capability name — two different vocabularies,
-// see readOnlyArgs in lib/grok.mjs. Memory is disabled, and runs are bounded by
-// both an idle timer and a wall-clock backstop. Output is parsed from grok's
+// tools, never agents. Every grok invocation allowlists read-only tools, removes
+// the mutating ones and the MCP meta-tools, denies writes/shell/MCP at the
+// permission layer, refuses anything needing approval (dontAsk), and runs under
+// the OS read-only sandbox — see readOnlyArgs in lib/grok.mjs. Memory is
+// disabled, and runs are bounded by both an idle timer and a wall-clock backstop. Output is parsed from grok's
 // streaming-json events so a stall or cancellation surfaces as a real failure
 // instead of silent empty stdout — and, just as importantly, so a completed
 // answer is never discarded because of an unrecognized stopReason.
@@ -16,7 +16,7 @@
 //   consult [--background] [--file <p>]... [--model <id>] [--effort <lvl>]
 //           [--timeout-ms <ms>] [--idle-ms <ms>] [--json] -- <question>
 //   review  [--background] [--base <ref>] [--scope auto|working-tree|branch]
-//           [--model <id>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json]
+//           [--model <id>] [--effort <lvl>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json]
 //   adversarial-review [...same as review...] [focus text]
 //   consult-worker --job-id <id>        (internal: detached background worker)
 //   status [job-id] [--all] [--wait] [--timeout-ms <ms>] [--json]
@@ -24,8 +24,8 @@
 //   cancel [job-id] [--json]
 
 import { spawn } from "node:child_process";
-import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
@@ -39,14 +39,17 @@ import {
 import {
   DEFAULT_IDLE_MS,
   DEFAULT_TIMEOUT_MS,
+  PROMPT_DIR_PREFIX,
   effortArgs,
   getGrokAuthStatus,
   getGrokAvailability,
-  killActiveGrok,
   readOnlyArgs,
   runGrok,
+  terminateActiveGrok,
+  terminateGroups,
 } from "./lib/grok.mjs";
 import {
+  ACTIVE_STATUSES,
   createJob,
   resolveJob,
   reconcile,
@@ -54,16 +57,10 @@ import {
   sortJobsNewestFirst,
   appendLog,
   currentSessionId,
+  nowIso,
+  transition,
 } from "./lib/jobs.mjs";
-import {
-  getConfig,
-  listJobs,
-  readJobFile,
-  resolveWorkspaceRoot,
-  upsertJob,
-  writeJobFile,
-  pidAlive,
-} from "./lib/state.mjs";
+import { ROOT, listJobs, pidMatches, readJobFile, resolveWorkspaceRoot } from "./lib/state.mjs";
 import {
   renderCancel,
   renderConsultResult,
@@ -76,8 +73,9 @@ import {
 } from "./lib/render.mjs";
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url);
-const SCRIPT_DIR = dirname(SCRIPT_PATH);
-const LOG_PATH = resolve(SCRIPT_DIR, "..", "logs", "companion.jsonl");
+// Next to the job registry, never inside the plugin directory: run from a
+// checkout, that put a log file in the user's repo.
+const LOG_PATH = join(ROOT, "companion.jsonl");
 
 function logEvent(event) {
   try {
@@ -122,12 +120,26 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-// `--idle-ms 0` disables idle detection, so a plain `Number(x) || DEFAULT`
-// would silently turn the documented off-switch back into the default.
-function parseIdleMs(raw) {
-  if (raw === undefined || raw === null || raw === "") return DEFAULT_IDLE_MS;
+// Millisecond flags. A bad value is an error, not a silent default: a negative
+// timeout used to reach setTimeout and kill the run immediately, and `0`
+// quietly became 15 minutes. `allowZero` is for --idle-ms, where 0 is the
+// documented off-switch.
+function parseMs(raw, name, fallback, { allowZero = false } = {}) {
+  if (raw === undefined || raw === null || raw === "") return fallback;
   const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_IDLE_MS;
+  if (!Number.isFinite(n) || n < 0 || (n === 0 && !allowZero)) {
+    throw new Error(
+      `--${name} must be a ${allowZero ? "non-negative" : "positive"} number of milliseconds (got "${raw}").`,
+    );
+  }
+  return n;
+}
+
+// Status listings carry the summary fields only — not the stored request,
+// payload and rendered output, which can be hundreds of kilobytes.
+function jobSummary(job) {
+  const { request, result, rendered, ...rest } = job;
+  return rest;
 }
 
 // Map a streaming-json ACP event onto a job-progress update.
@@ -194,8 +206,8 @@ function parseConsultOptions(argv) {
     model: options.model || null,
     effort: options.effort || null,
     reasoningEffort: options["reasoning-effort"] || null,
-    timeoutMs: Number(options["timeout-ms"]) || DEFAULT_TIMEOUT_MS,
-    idleMs: parseIdleMs(options["idle-ms"]),
+    timeoutMs: parseMs(options["timeout-ms"], "timeout-ms", DEFAULT_TIMEOUT_MS),
+    idleMs: parseMs(options["idle-ms"], "idle-ms", DEFAULT_IDLE_MS, { allowZero: true }),
     files: options.file ?? [],
     question,
   };
@@ -206,14 +218,10 @@ async function runConsult(req, progress) {
   const eff = effortArgs(req);
   if (eff.dropped) progress?.({ message: eff.dropped });
   const args = [
-    "-p",
-    prompt,
     // streaming-json (not `stream-json`) so a stalled relay is visible as an
     // absence of events rather than an 8-minute silence.
     "--output-format",
     "streaming-json",
-    "--permission-mode",
-    "default",
     ...readOnlyArgs({ web: true }),
     ...eff.args,
   ];
@@ -221,6 +229,7 @@ async function runConsult(req, progress) {
 
   progress?.({ phase: "asking", message: "Sending question to grok…" });
   const result = await runGrok(args, {
+    prompt,
     cwd: req.cwd,
     timeoutMs: req.timeoutMs,
     idleMs: req.idleMs,
@@ -274,6 +283,7 @@ async function handleConsult(argv) {
     return;
   }
 
+  installCancelHandlers(workspaceRoot, job.id);
   const execution = await runTrackedJob(job, (progress) => runConsult(req, progress));
   out(execution.payload, req.json, execution.rendered);
   if (!execution.ok) process.exitCode = execution.exitCode || 1;
@@ -283,7 +293,16 @@ async function handleConsult(argv) {
 
 function parseReviewOptions(argv) {
   const { options, positionals } = parseArgs(normalizeArgv(argv), {
-    valueOptions: ["base", "scope", "model", "timeout-ms", "idle-ms", "cwd"],
+    valueOptions: [
+      "base",
+      "scope",
+      "model",
+      "effort",
+      "reasoning-effort",
+      "timeout-ms",
+      "idle-ms",
+      "cwd",
+    ],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: { m: "model" },
   });
@@ -294,8 +313,10 @@ function parseReviewOptions(argv) {
     base: options.base || null,
     scope: options.scope || "auto",
     model: options.model || null,
-    timeoutMs: Number(options["timeout-ms"]) || DEFAULT_TIMEOUT_MS,
-    idleMs: parseIdleMs(options["idle-ms"]),
+    effort: options.effort || null,
+    reasoningEffort: options["reasoning-effort"] || null,
+    timeoutMs: parseMs(options["timeout-ms"], "timeout-ms", DEFAULT_TIMEOUT_MS),
+    idleMs: parseMs(options["idle-ms"], "idle-ms", DEFAULT_IDLE_MS, { allowZero: true }),
     focusText: positionals.join(" ").trim(),
   };
 }
@@ -317,19 +338,19 @@ async function runReview(req, kind, progress) {
   const prompt = buildReviewPrompt(req.cwd, target, context, {
     focusText: kind === "adversarial-review" ? req.focusText : "",
   });
+  const eff = effortArgs(req);
+  if (eff.dropped) progress?.({ message: eff.dropped });
   const args = [
-    "-p",
-    prompt,
     "--output-format",
     "streaming-json",
-    "--permission-mode",
-    "default",
     ...readOnlyArgs({ web: false }),
+    ...eff.args,
   ];
   if (req.model) args.push("--model", req.model);
 
   progress?.({ phase: "reviewing", message: `Reviewing ${target.label}…` });
   const result = await runGrok(args, {
+    prompt,
     cwd: req.cwd,
     timeoutMs: req.timeoutMs,
     idleMs: req.idleMs,
@@ -362,6 +383,9 @@ async function runReview(req, kind, progress) {
 
 async function handleReview(argv, kind = "review") {
   const req = parseReviewOptions(argv);
+  // Fail on a bad --scope / --base now, before a background job is queued for it.
+  ensureGitRepository(req.cwd);
+  resolveReviewTarget(req.cwd, { base: req.base, scope: req.scope });
   ensureGrokReady();
   const workspaceRoot = resolveWorkspaceRoot(req.cwd);
   const title = kind === "adversarial-review" ? "Grok Adversarial Review" : "Grok Review";
@@ -381,12 +405,16 @@ async function handleReview(argv, kind = "review") {
     return;
   }
 
+  installCancelHandlers(workspaceRoot, job.id);
   const execution = await runTrackedJob(job, (progress) => runReview(req, kind, progress));
   out(execution.payload, req.json, execution.rendered);
   if (!execution.ok) process.exitCode = execution.exitCode || 1;
 }
 
 // ---------- background worker ----------
+
+// Identifies our own processes in `ps` before anything signals a stored pid.
+const WORKER_MARK = "grok-companion.mjs";
 
 function launchWorker(cwd, jobId) {
   const child = spawn(process.execPath, [SCRIPT_PATH, "consult-worker", "--job-id", jobId, "--cwd", cwd], {
@@ -395,16 +423,39 @@ function launchWorker(cwd, jobId) {
     detached: true,
     stdio: "ignore",
   });
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  // Only record the worker pid. Do NOT rewrite status/phase here: a fast worker
-  // may already have advanced to running/terminal, and regressing it to queued
-  // would corrupt the state machine.
-  const stored = readJobFile(workspaceRoot, jobId);
-  if (stored && stored.status === "queued") {
-    writeJobFile(workspaceRoot, jobId, { ...stored, pid: child.pid ?? null });
-    upsertJob(workspaceRoot, { id: jobId, pid: child.pid ?? null });
-  }
+  // Record the worker pid only while the job is still queued with no pid. A
+  // fast worker may already be running (and has written its own pid); writing
+  // over it from here is how a finished job used to roll back to queued.
+  transition(resolveWorkspaceRoot(cwd), jobId, ["queued"], (current) =>
+    current.pid == null && child.pid ? { pid: child.pid } : null,
+  );
   child.unref();
+}
+
+// SIGTERM / SIGINT / SIGHUP: stop grok (escalating to SIGKILL), then record the
+// cancellation. Installed for foreground runs as well as workers — grok runs in
+// its own process group, so Ctrl-C on a foreground run used to kill only the
+// companion and leave grok running.
+function installCancelHandlers(workspaceRoot, jobId) {
+  let stopping = false;
+  const onSignal = async (signal) => {
+    if (stopping) return;
+    stopping = true;
+    // Record the cancellation BEFORE killing grok: once grok dies, the run
+    // resolves and would otherwise record the kill as a `failed` job first.
+    const { changed, job } = transition(workspaceRoot, jobId, ["queued", "running"], {
+      status: "cancelled",
+      phase: "cancelled",
+      pid: null,
+      grokPid: null,
+      completedAt: nowIso(),
+      errorMessage: `Cancelled (${signal}).`,
+    });
+    if (changed) appendLog(job.logFile, `Cancelled (${signal}).`);
+    await terminateActiveGrok();
+    process.exit(130);
+  };
+  for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, onSignal);
 }
 
 async function handleWorker(argv) {
@@ -416,28 +467,9 @@ async function handleWorker(argv) {
   if (!stored || !stored.request) {
     throw new Error(`No stored request for job ${options["job-id"]}.`);
   }
-  // If cancelled (worker receives SIGTERM), tear down the detached grok child
-  // before exiting so it does not orphan, then mark the job cancelled.
-  const onSignal = () => {
-    killActiveGrok("SIGTERM");
-    const latest = readJobFile(workspaceRoot, stored.id) ?? stored;
-    if (latest.status === "running" || latest.status === "queued") {
-      const cancelled = {
-        ...latest,
-        status: "cancelled",
-        phase: "cancelled",
-        pid: null,
-        grokPid: null,
-        completedAt: new Date().toISOString(),
-        errorMessage: "Cancelled by user.",
-      };
-      writeJobFile(workspaceRoot, stored.id, cancelled);
-      upsertJob(workspaceRoot, cancelled);
-    }
-    process.exit(130);
-  };
-  process.on("SIGTERM", onSignal);
-  process.on("SIGINT", onSignal);
+  // Cancelled (or reconciled) before this worker got going: do not run it.
+  if (stored.status !== "queued") return;
+  installCancelHandlers(workspaceRoot, stored.id);
 
   const req = stored.request;
   const runner = (progress) =>
@@ -448,7 +480,9 @@ async function handleWorker(argv) {
 // ---------- status / result / cancel ----------
 
 function visibleJobs(workspaceRoot, { all }) {
-  let jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).map((j) => reconcile(workspaceRoot, j));
+  let jobs = sortJobsNewestFirst(listJobs(workspaceRoot))
+    .map((j) => reconcile(workspaceRoot, j))
+    .map(jobSummary);
   if (!all) {
     const sid = currentSessionId();
     if (sid) {
@@ -471,14 +505,14 @@ async function handleStatus(argv) {
   if (reference) {
     let job = resolveJob(workspaceRoot, reference);
     if (options.wait) {
-      const deadline = Date.now() + (Number(options["timeout-ms"]) || 240000);
-      const interval = Number(options["poll-interval-ms"]) || 2000;
-      while ((job.status === "queued" || job.status === "running") && Date.now() < deadline) {
+      const deadline = Date.now() + parseMs(options["timeout-ms"], "timeout-ms", 240_000);
+      const interval = parseMs(options["poll-interval-ms"], "poll-interval-ms", 2_000);
+      while (ACTIVE_STATUSES.has(job.status) && Date.now() < deadline) {
         await sleep(Math.min(interval, Math.max(0, deadline - Date.now())));
         job = resolveJob(workspaceRoot, reference);
       }
     }
-    out(job, options.json, renderJobStatus(job));
+    out(jobSummary(job), options.json, renderJobStatus(job));
     return;
   }
   if (options.wait) throw new Error("`status --wait` requires a job id.");
@@ -492,52 +526,48 @@ function handleResult(argv) {
     booleanOptions: ["json"],
   });
   const workspaceRoot = resolveWorkspaceRoot(resolveCwd(options));
-  const summary = resolveJob(workspaceRoot, positionals[0]);
-  const full = readJobFile(workspaceRoot, summary.id) ?? summary;
-  out(full, options.json, renderStoredResult(full));
+  const job = resolveJob(workspaceRoot, positionals[0]);
+  out(job, options.json, renderStoredResult(job));
 }
 
-function handleCancel(argv) {
+async function handleCancel(argv) {
   const { options, positionals } = parseArgs(normalizeArgv(argv), {
     valueOptions: ["cwd"],
     booleanOptions: ["json"],
   });
   const workspaceRoot = resolveWorkspaceRoot(resolveCwd(options));
   const job = resolveJob(workspaceRoot, positionals[0]);
-  // Signal the worker (which tears down its grok child via SIGTERM handler), and
-  // also directly kill the detached grok process group as a backstop in case the
-  // worker is wedged.
-  signalPidGroup(job.pid, "SIGTERM");
-  signalPidGroup(job.grokPid, "SIGTERM");
-  const stored = readJobFile(workspaceRoot, job.id) ?? job;
-  const cancelled = {
-    ...stored,
+  // Record the cancellation first, and only for a job that is still active: a
+  // finished job is left alone (cancel with no id picks the newest job, which
+  // used to rewrite a completed review as cancelled and hide its output).
+  const { changed, job: latest } = transition(workspaceRoot, job.id, ["queued", "running"], {
     status: "cancelled",
     phase: "cancelled",
     pid: null,
-    completedAt: new Date().toISOString(),
+    grokPid: null,
+    completedAt: nowIso(),
     errorMessage: "Cancelled by user.",
-  };
-  writeJobFile(workspaceRoot, job.id, cancelled);
-  upsertJob(workspaceRoot, cancelled);
-  appendLog(stored.logFile, "Cancelled by user.");
-  out({ jobId: job.id, status: "cancelled" }, options.json, renderCancel(job));
+  });
+  if (!changed) {
+    out(
+      { jobId: job.id, status: latest?.status ?? job.status, cancelled: false },
+      options.json,
+      renderCancel(latest ?? job, { cancelled: false }),
+    );
+    return;
+  }
+  appendLog(latest.logFile, "Cancelled by user.");
+  // Stop the worker (its handler tears down grok) and, as a backstop, grok's own
+  // group — but only pids that are verifiably still ours: a stored pid can have
+  // been reused by an unrelated process since it was recorded.
+  const pids = [];
+  if (pidMatches(job.pid, WORKER_MARK)) pids.push(job.pid);
+  if (pidMatches(job.grokPid, PROMPT_DIR_PREFIX)) pids.push(job.grokPid);
+  await terminateGroups(pids);
+  out({ jobId: job.id, status: "cancelled", cancelled: true }, options.json, renderCancel(latest));
 }
 
 // ---------- shared ----------
-
-function signalPidGroup(pid, signal) {
-  if (!pid || !pidAlive(pid)) return;
-  try {
-    process.kill(-pid, signal); // process group
-  } catch {
-    try {
-      process.kill(pid, signal);
-    } catch {
-      /* already gone */
-    }
-  }
-}
 
 function ensureGrokReady() {
   const grok = getGrokAvailability();
@@ -576,7 +606,7 @@ async function main() {
         handleResult(argv);
         break;
       case "cancel":
-        handleCancel(argv);
+        await handleCancel(argv);
         break;
       case undefined:
       case "help":
@@ -599,15 +629,16 @@ function usage() {
   return [
     "Usage:",
     "  grok-companion.mjs setup [--json]",
-    '  grok-companion.mjs consult [--background] [--file <p>]... [--model <id>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json] -- <question>',
-    "  grok-companion.mjs review [--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <id>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json]",
-    "",
-    "  --timeout-ms  wall-clock backstop (default 15m).",
-    "  --idle-ms     kill after this long with no output at all (default 3m, 0 disables).",
+    "  grok-companion.mjs consult [--background] [--file <p>]... [--model <id>] [--effort <lvl>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json] -- <question>",
+    "  grok-companion.mjs review [--background] [--base <ref>] [--scope auto|working-tree|branch] [--model <id>] [--effort <lvl>] [--timeout-ms <ms>] [--idle-ms <ms>] [--json]",
     "  grok-companion.mjs adversarial-review [...review flags...] [focus text]",
-    "  grok-companion.mjs status [job-id] [--all] [--wait] [--json]",
+    "  grok-companion.mjs status [job-id] [--all] [--wait] [--timeout-ms <ms>] [--json]",
     "  grok-companion.mjs result [job-id] [--json]",
     "  grok-companion.mjs cancel [job-id] [--json]",
+    "",
+    "  --effort      reasoning effort (default medium, or $GROK_PLUGIN_EFFORT; 'default' = CLI's own).",
+    "  --timeout-ms  wall-clock backstop (default 15m).",
+    "  --idle-ms     kill after this long with no output at all (default 3m, 0 disables).",
     "",
   ].join("\n");
 }

@@ -75,15 +75,18 @@ export function renderJobStatus(job) {
 
 export function renderStoredResult(job) {
   if (!job) return "Job not found.\n";
-  if (job.status !== "completed" && job.status !== "failed") {
+  if (job.status === "queued" || job.status === "running") {
     return `Job ${job.id} is ${job.status} — no final output yet. Check \`/grok:status ${job.id}\`.\n`;
   }
+  // A cancelled job can still hold output that arrived before the cancel.
   if (job.rendered) return job.rendered;
+  if (job.status === "cancelled") return `[grok] ${job.title} was cancelled before it produced output.\n`;
   if (job.errorMessage) return `[grok] ${job.title} failed: ${job.errorMessage}\n`;
   return "No stored output.\n";
 }
 
-export function renderCancel(job) {
+export function renderCancel(job, { cancelled = true } = {}) {
+  if (!cancelled) return `Job ${job.id} is already ${job.status}; nothing to cancel.\n`;
   return `Cancelled ${job.id} (${job.title}).\n`;
 }
 

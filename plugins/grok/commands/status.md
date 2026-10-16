@@ -5,7 +5,7 @@ disable-model-invocation: true
 allowed-tools: Bash(node:*)
 ---
 
-!`node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" status "$ARGUMENTS"`
+!`node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-companion.mjs" status '$ARGUMENTS'`
 
 If no job ID was passed:
 - Render the output as a single compact Markdown table of current and recent jobs.

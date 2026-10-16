@@ -32,17 +32,21 @@ rewriting your code. Early naive wrappers had three problems:
 
 This plugin fixes all three:
 
-- **Strictly read-only.** Every Grok invocation both *removes* the mutating tools
-  from the toolset (`run_terminal_cmd`, `search_replace`, `write_file`, … plus
-  `Agent` to block subagent spawning) and *denies* them at the permission layer,
-  disables cross-session memory, and (for review) disables web search. The deny
-  rules override any allow-rules Grok would otherwise inherit. Grok physically
-  cannot edit your working tree.
+- **Strictly read-only, in layers.** Every Grok invocation *allowlists* only
+  read-only tools (`read_file`, `grep`, `list_dir`, plus web search/fetch for
+  consult), *removes* the mutating tools and the MCP meta-tools, *denies*
+  writes, shell and MCP calls at the permission layer, refuses anything that
+  would need approval (`--permission-mode dontAsk`), and runs Grok inside the
+  OS **`read-only` sandbox** (Seatbelt on macOS, Landlock on Linux) — which also
+  covers anything Grok spawns, such as hooks or local MCP servers. If the
+  sandbox can't be applied, Grok would carry on unsandboxed, so the companion
+  stops the run instead. Memory is disabled, and reviews also disable web access.
 
-  These are two different vocabularies and both matter: `--disallowed-tools`
-  takes Grok's **internal tool ids**, while `--allow`/`--deny` take
-  **Claude-style capability names**. Passing capability names to
-  `--disallowed-tools` removes nothing — they are silently ignored.
+  The tool lists use two different vocabularies and both matter: `--tools` /
+  `--disallowed-tools` take Grok's **internal tool ids**, while `--allow`/`--deny`
+  take **Claude-style capability names**. Unknown names are silently ignored —
+  which is why the allowlist exists: the old denylist missed Grok's `write`
+  tool entirely.
 - **Honest failures — in both directions.** A relay cancellation, a stall, or an
   empty answer is reported as a real, non-zero failure, never as a silent empty
   success. Just as importantly, a *completed* answer is never thrown away:
@@ -52,8 +56,10 @@ This plugin fixes all three:
   are returned with a warning rather than discarded.
 - **Stall detection.** Runs stream their events, so a stalled relay is caught as
   an absence of output within minutes instead of burning the full watchdog. A
-  wall-clock backstop (SIGTERM → SIGKILL on the process group) still bounds the
-  worst case, with no orphaned processes.
+  wall-clock backstop still bounds the worst case. Every way a run can end
+  early — timeout, stall, `/grok:cancel`, Ctrl-C — sends SIGTERM to Grok's
+  process group and escalates to SIGKILL before the companion exits, so no
+  process is left behind.
 - **Background jobs with status.** Long consultations/reviews run as detached
   workers tracked in an on-disk registry. Check them with `/grok:status`,
   read them with `/grok:result`, stop them with `/grok:cancel`. Job state lives
@@ -105,14 +111,34 @@ fix if not.
 - `--background` — run as a tracked detached job; read it back with
   `/grok:status` / `/grok:result`. (Foreground is the default for small asks.)
 - `--model <id>` — pin a specific Grok model.
-- `--effort <low|medium|high|xhigh|max>` — reasoning effort. Automatically
+- `--effort <low|medium|high|xhigh|max>` — reasoning effort, on `consult`,
+  `review` and `adversarial-review`. **Defaults to `medium`** (the grok CLI's
+  own default is `high`, which is very slow for routine asks). Automatically
   dropped if the target model doesn't support it (so it never 400s).
 - `--scope auto|working-tree|branch` and `--base <ref>` — for reviews.
-- `--timeout-ms <ms>` — wall-clock backstop (default 15 minutes).
+- `--timeout-ms <ms>` — wall-clock backstop (default 15 minutes; must be > 0).
 - `--idle-ms <ms>` — kill a run that produces no output at all for this long
   (default 3 minutes). Catches a stalled relay long before the backstop. Don't
   set it much lower: Grok can spend up to 120s draining usage after the answer
   without emitting anything.
+
+### Changing the default effort
+
+Per call, pass `--effort`, e.g. `/grok:review --effort high`.
+
+To change the default for every call, set `GROK_PLUGIN_EFFORT` in
+`~/.claude/settings.json` (or a project's `.claude/settings.json`) and restart
+Claude Code:
+
+```json
+{
+  "env": {
+    "GROK_PLUGIN_EFFORT": "high"
+  }
+}
+```
+
+Use `"default"` to send no effort flag and let the grok CLI decide.
 
 ### Examples
 
@@ -162,11 +188,14 @@ scripts/
 Run the test suite with:
 
 ```text
-node plugins/grok/scripts/test/runner.test.mjs
+node --test plugins/grok/scripts/test/
 ```
 
-It replays Grok's real streaming wire format through a stub binary — no
-dependencies, no network.
+`runner.test.mjs` replays Grok's real streaming wire format through a stub
+binary (classification, watchdogs, process-group teardown, read-only argv,
+effort selection); `state.test.mjs` covers argument parsing, review-context
+collection in throwaway repos, and the job state machine. No dependencies, no
+network.
 
 The model is the same one the codex plugin uses: a **thin forwarder**. Slash
 commands and the subagent never reason through your problem or act on Grok's
@@ -178,18 +207,29 @@ review the findings and apply changes yourself.
 Each `grok` call is constructed with:
 
 ```
-# Grok's INTERNAL tool ids — capability names here are silently ignored:
---disallowed-tools run_terminal_cmd,run_terminal_command,search_replace,\
-                   write_file,create_file,apply_patch,delete_file,Agent
+--prompt-file <tmp>/prompt.md                               # no argv size limit
+# Grok's INTERNAL tool ids — an allowlist, then a removal backstop:
+--tools read_file,grep,list_dir[,web_search,web_fetch]      # web: consult only
+--disallowed-tools run_terminal_cmd,run_terminal_command,search_replace,write,\
+                   write_file,create_file,apply_patch,delete_file,\
+                   search_tool,use_tool,Agent               # incl. MCP meta-tools
 # Claude-style CAPABILITY names — a different vocabulary, gates execution:
---deny Write --deny Edit --deny Bash
+--deny Write --deny Edit --deny Bash --deny MCPTool
+[--deny WebFetch --deny WebSearch --disable-web-search]     # reviews only
+--permission-mode dontAsk                                   # refuse, never prompt or auto-run
+--sandbox read-only                                         # OS-enforced; fatal if not applied
 --no-subagents --no-memory                                  # no side channels
 --output-format streaming-json                              # parseable + liveness signal
-[--disable-web-search]                                      # reviews only
 ```
 
-Job and log state lives under `~/.grok/companion/<workspace>/`, never in your
-repo.
+What this does **not** cover: Grok still reads your files (that is the point)
+and, for consult, can reach the web — so anything in the attached files or the
+repo can end up in a web request. Hooks you have configured for Grok still run,
+but inside the sandbox. On macOS the sandbox does not block network access from
+processes Grok spawns.
+
+Job state and the companion's own log live under `~/.grok/companion/`, never
+in your repo.
 
 ---
 
