@@ -4,6 +4,22 @@ All notable changes to this plugin are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — 2026-10-16
+
+### Fixed
+
+- **Linux without bubblewrap no longer fails every run.** On Linux, grok's
+  `read-only` sandbox write-protects its hook and config files with a
+  bubblewrap bind-mount, and grok 1.0.60 refuses to start the profile when
+  `bwrap` is missing (plain `grok` still runs fine). The companion now checks
+  for `bwrap` first. If it is missing, the run goes ahead without `--sandbox`
+  and says so in a warning. The tool allowlist, `--deny` rules and `dontAsk`
+  still keep grok's own tools read-only, but hooks and MCP servers it spawns
+  are not OS-confined. Set `GROK_COMPANION_REQUIRE_SANDBOX=1` to make the
+  sandbox mandatory instead.
+- grok's bubblewrap refusal is now reported with how to fix it, and
+  `/grok:setup` shows the sandbox status on Linux.
+
 ## [0.5.0] — 2026-10-16
 
 Fixes from a whole-codebase review by Codex and Grok, plus a faster default.

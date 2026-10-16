@@ -94,6 +94,11 @@ export function renderSetup(report) {
   const lines = ["Grok companion setup:"];
   lines.push(`  grok CLI: ${report.grok.available ? `✓ ${report.grok.version}` : "✗ not found"}`);
   lines.push(`  auth:     ${report.auth.loggedIn ? "✓ logged in" : "✗ not logged in"}`);
+  if (report.sandbox) {
+    lines.push(
+      `  sandbox:  ${report.sandbox.available ? "✓ read-only" : report.sandbox.required ? "✗ bwrap missing (required)" : "⚠ bwrap missing — runs unsandboxed"}`,
+    );
+  }
   lines.push(`  ready:    ${report.ready ? "✓" : "✗"}`);
   if (report.nextSteps.length) {
     lines.push("", "Next steps:");

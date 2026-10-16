@@ -222,7 +222,22 @@ check("sandbox failure stops the run", r.ok === false && r.sandboxFailed === tru
 check("sandbox failure is named", /sandbox/.test(r.errorMessage || ""), r.errorMessage);
 check("sandbox failure is caught before the answer", !r.text.includes("ran unsandboxed"), r.text);
 
-const { readOnlyArgs } = await import(LIB);
+r = await runFake(
+  "nobwrap",
+  `#!/bin/sh\necho "Error: this sandbox could not enforce its deny list on Linux: bwrap exec failed: No such file or directory (os error 2). Install bubblewrap with \\\`apt install -y bubblewrap\\\`. Refusing to start with denied paths unprotected." >&2\nexit 1\n`,
+);
+check("bwrap refusal fails the run", r.ok === false && r.sandboxFailed === true, r);
+check("bwrap refusal explains the fix", /bubblewrap/.test(r.errorMessage || "") && /PATH/.test(r.errorMessage || ""), r.errorMessage);
+
+const { readOnlyArgs, sandboxAvailability } = await import(LIB);
+check("unsandboxed fallback omits --sandbox", !readOnlyArgs({ web: false, sandbox: false }).includes("--sandbox"));
+check(
+  "unsandboxed fallback keeps the tool allowlist",
+  readOnlyArgs({ web: false, sandbox: false }).includes("--tools"),
+);
+if (process.platform !== "linux") {
+  check("sandbox counts as available off Linux", sandboxAvailability().available === true);
+}
 const consultArgs = readOnlyArgs({ web: true });
 const reviewArgs = readOnlyArgs({ web: false });
 const valueOf = (args, flag) => args[args.indexOf(flag) + 1];

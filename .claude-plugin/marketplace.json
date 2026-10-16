@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Marketplace for the Grok consultation plugin for Claude Code.",
-    "version": "0.5.0"
+    "version": "0.5.1"
   },
   "plugins": [
     {
       "name": "grok",
       "description": "Consult xAI's Grok CLI from Claude Code for a strictly read-only second opinion or code review.",
-      "version": "0.5.0",
+      "version": "0.5.1",
       "author": {
         "name": "faeton"
       },

@@ -5,8 +5,8 @@
 // tools, never agents. Every grok invocation allowlists read-only tools, removes
 // the mutating ones and the MCP meta-tools, denies writes/shell/MCP at the
 // permission layer, refuses anything needing approval (dontAsk), and runs under
-// the OS read-only sandbox — see readOnlyArgs in lib/grok.mjs. Memory is
-// disabled, and runs are bounded by both an idle timer and a wall-clock backstop. Output is parsed from grok's
+// the OS read-only sandbox (when grok can apply it) — see readOnlyArgs in
+// lib/grok.mjs. Memory is disabled, and runs are bounded by both an idle timer and a wall-clock backstop. Output is parsed from grok's
 // streaming-json events so a stall or cancellation surfaces as a real failure
 // instead of silent empty stdout — and, just as importantly, so a completed
 // answer is never discarded because of an unrecognized stopReason.
@@ -45,6 +45,7 @@ import {
   getGrokAvailability,
   readOnlyArgs,
   runGrok,
+  sandboxAvailability,
   terminateActiveGrok,
   terminateGroups,
 } from "./lib/grok.mjs";
@@ -176,7 +177,16 @@ async function handleSetup(argv) {
   } else if (!auth.loggedIn) {
     nextSteps.push("Run `!grok login` to authenticate.");
   }
-  const report = { ready: grok.available && auth.loggedIn, grok, auth, nextSteps };
+  const sandbox = sandboxAvailability();
+  if (!sandbox.available) {
+    nextSteps.push(
+      sandbox.required
+        ? "Install bubblewrap (`bwrap`) or put a standalone binary on PATH — GROK_COMPANION_REQUIRE_SANDBOX=1 makes runs fail without it."
+        : "Optional: install bubblewrap (`bwrap`) so grok runs under its OS read-only sandbox; without it runs proceed unsandboxed with a warning.",
+    );
+  }
+  const ready = grok.available && auth.loggedIn && (sandbox.available || !sandbox.required);
+  const report = { ready, grok, auth, sandbox, nextSteps };
   out(report, options.json, renderSetup(report));
 }
 
@@ -217,12 +227,14 @@ async function runConsult(req, progress) {
   const prompt = buildConsultPrompt({ question: req.question, files: req.files, cwd: req.cwd });
   const eff = effortArgs(req);
   if (eff.dropped) progress?.({ message: eff.dropped });
+  const sandbox = sandboxAvailability();
+  if (sandbox.warning) progress?.({ message: sandbox.warning });
   const args = [
     // streaming-json (not `stream-json`) so a stalled relay is visible as an
     // absence of events rather than an 8-minute silence.
     "--output-format",
     "streaming-json",
-    ...readOnlyArgs({ web: true }),
+    ...readOnlyArgs({ web: true, sandbox: sandbox.available || sandbox.required }),
     ...eff.args,
   ];
   if (req.model) args.push("--model", req.model);
@@ -236,6 +248,9 @@ async function runConsult(req, progress) {
     onProgress: (event) => progress?.(streamPhase(event)),
     onSpawn: ({ pid }) => progress?.({ grokPid: pid }),
   });
+  if (sandbox.warning) {
+    result.warning = [sandbox.warning, result.warning].filter(Boolean).join(" ");
+  }
   return {
     ok: result.ok,
     exitCode: result.exitCode,
@@ -340,10 +355,12 @@ async function runReview(req, kind, progress) {
   });
   const eff = effortArgs(req);
   if (eff.dropped) progress?.({ message: eff.dropped });
+  const sandbox = sandboxAvailability();
+  if (sandbox.warning) progress?.({ message: sandbox.warning });
   const args = [
     "--output-format",
     "streaming-json",
-    ...readOnlyArgs({ web: false }),
+    ...readOnlyArgs({ web: false, sandbox: sandbox.available || sandbox.required }),
     ...eff.args,
   ];
   if (req.model) args.push("--model", req.model);
@@ -357,6 +374,9 @@ async function runReview(req, kind, progress) {
     onProgress: (event) => progress?.(streamPhase(event)),
     onSpawn: ({ pid }) => progress?.({ grokPid: pid }),
   });
+  if (sandbox.warning) {
+    result.warning = [sandbox.warning, result.warning].filter(Boolean).join(" ");
+  }
   return {
     ok: result.ok,
     exitCode: result.exitCode,

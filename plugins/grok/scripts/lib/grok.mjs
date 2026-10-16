@@ -155,12 +155,45 @@ const DENIED_CAPABILITIES = ["Write", "Edit", "Bash", "MCPTool"];
 //    included — and allows writes only to ~/.grok and temp dirs. If the sandbox
 //    cannot be applied grok merely warns and runs unsandboxed, so runGrok treats
 //    that warning as fatal (see SANDBOX_FAILED).
+//
+//    On Linux the profile also write-denies grok's hook and config files with a
+//    bubblewrap bind-mount, and without `bwrap` grok refuses the profile outright
+//    (SANDBOX_REFUSED). Plain grok runs fine there, so rather than fail every run
+//    the companion drops --sandbox and says so (see sandboxAvailability): layers
+//    1-4 still keep grok's own tools read-only, but hooks and stdio MCP servers
+//    it spawns are no longer OS-confined. GROK_COMPANION_REQUIRE_SANDBOX=1 keeps
+//    the sandbox mandatory instead.
 export const SANDBOX_PROFILE = "read-only";
 const SANDBOX_FAILED = /sandbox could not be applied/i;
+const SANDBOX_REFUSED = /bwrap|bubblewrap|could not enforce its deny list/i;
+const BWRAP_HINT =
+  "On Linux grok needs bubblewrap (`bwrap`) for its read-only sandbox. Install it, " +
+  "or put a standalone `bwrap` binary on PATH (e.g. ~/.local/bin), or unset " +
+  "GROK_COMPANION_REQUIRE_SANDBOX to run without the OS sandbox.";
+
+// Whether grok can apply the read-only sandbox here. Only Linux has a missing
+// dependency to detect; elsewhere the run's own SANDBOX_FAILED check covers it.
+export function sandboxAvailability() {
+  if (process.platform !== "linux") return { available: true, required: true, warning: null };
+  const required = process.env.GROK_COMPANION_REQUIRE_SANDBOX === "1";
+  const res = spawnSync("bwrap", ["--version"], { stdio: "ignore" });
+  if (required || (!res.error && res.status === 0)) {
+    return { available: !res.error && res.status === 0, required: true, warning: null };
+  }
+  return {
+    available: false,
+    required: false,
+    warning:
+      "Ran without grok's OS read-only sandbox: bubblewrap (`bwrap`) is not on PATH. " +
+      "grok's tools are still limited to read-only ones, but its hooks and MCP " +
+      "servers are not OS-confined.",
+  };
+}
 
 // Read-only argv shared by consult and review. `web` toggles web search/fetch
-// (on for consult, off for review).
-export function readOnlyArgs({ web = true } = {}) {
+// (on for consult, off for review); `sandbox: false` omits --sandbox when
+// sandboxAvailability() says it cannot be applied.
+export function readOnlyArgs({ web = true, sandbox = true } = {}) {
   const args = [
     "--tools",
     [...READ_TOOLS, ...(web ? WEB_TOOLS : [])].join(","),
@@ -168,8 +201,7 @@ export function readOnlyArgs({ web = true } = {}) {
     REMOVED_TOOLS.join(","),
     "--permission-mode",
     "dontAsk",
-    "--sandbox",
-    SANDBOX_PROFILE,
+    ...(sandbox ? ["--sandbox", SANDBOX_PROFILE] : []),
     "--no-subagents",
     "--no-memory",
   ];
@@ -595,6 +627,11 @@ export function runGrok(args, options = {}) {
         errorMessage =
           `grok could not apply the ${SANDBOX_PROFILE} sandbox, so the run was stopped ` +
           `rather than continue unsandboxed: ${firstStderrLine(stderr)}`;
+      } else if (!completeTurn && code !== 0 && SANDBOX_REFUSED.test(stderr)) {
+        // grok refused to start the profile at all (Linux without bwrap).
+        ok = false;
+        sandboxFailed = true;
+        errorMessage = `${firstStderrLine(stderr)} ${BWRAP_HINT}`;
       } else if (completeTurn) {
         const verdict = classifyStopReason(stopReason, text);
         ok = verdict.ok;
