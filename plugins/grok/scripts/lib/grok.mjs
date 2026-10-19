@@ -281,7 +281,7 @@ export function readOnlyArgs({ web = true, sandbox = true } = {}) {
 }
 
 export function getGrokAvailability() {
-  const res = spawnSync(GROK_BIN, ["--version"], { encoding: "utf8" });
+  const res = spawnSync(GROK_BIN, ["--version"], { encoding: "utf8", timeout: MODEL_PROBE_TIMEOUT_MS });
   if (res.error || res.status !== 0) {
     return { available: false, version: null };
   }
@@ -617,6 +617,10 @@ export function runGrok(args, options = {}) {
     // What the run was doing, so a timeout can say so instead of "no response".
     const activity = { toolCalls: 0, lastEventAt: null };
 
+    // Stateful decoding: a multibyte character split across chunks stays intact.
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+
     child.stdout.on("data", (buf) => {
       touch();
       const chunk = buf.toString("utf8");
@@ -663,10 +667,10 @@ export function runGrok(args, options = {}) {
       // that ignores SIGTERM and dropped the pipes is still alive. Finish the
       // escalation BEFORE resolving — the old code unref'd the SIGKILL timer,
       // so the companion exited first and the descendant survived.
-      if (killTimer) {
-        clearTimeout(killTimer);
-        await terminateGroups([child.pid], { graceMs });
-      }
+      if (killTimer) clearTimeout(killTimer);
+      // Also after a clean exit: a descendant that closed its pipes can outlive
+      // the leader. No-op when the group is already gone.
+      await terminateGroups([child.pid], { graceMs });
       activeChildren.delete(child);
       resolveRun({ ...result, durationMs: Date.now() - startedAt });
     };

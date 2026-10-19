@@ -278,7 +278,7 @@ function changedFilesSection(cwd, target, paths) {
 export function collectReviewContext(cwd, target) {
   if (target.mode === "branch") {
     const base = target.baseRef;
-    const diff = gitOrThrow(["diff", "--end-of-options", `${base}...HEAD`], cwd);
+    const diff = gitOrThrow(["diff", "--no-ext-diff", "--no-textconv", "--end-of-options", `${base}...HEAD`], cwd);
     checkDiffSize(diff);
     const log = gitOrThrow(["log", "--oneline", "--end-of-options", `${base}..HEAD`], cwd);
     const sections = [`Comparing against base: ${base} (\`git diff ${base}...HEAD\`)`];
@@ -300,8 +300,8 @@ export function collectReviewContext(cwd, target) {
   if (status.trim()) {
     sections.push("", "git status:", "```", status.trim(), "```");
   }
-  const staged = gitOrThrow(["diff", "--cached"], cwd);
-  const unstaged = gitOrThrow(["diff"], cwd);
+  const staged = gitOrThrow(["diff", "--no-ext-diff", "--no-textconv", "--cached"], cwd);
+  const unstaged = gitOrThrow(["diff", "--no-ext-diff", "--no-textconv"], cwd);
   const diff = [staged, unstaged].filter((s) => s.trim()).join("\n");
   checkDiffSize(diff);
 

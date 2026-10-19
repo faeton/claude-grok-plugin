@@ -4,6 +4,23 @@ All notable changes to this plugin are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] — 2026-10-19
+
+Hardening backported from the agy plugin review (Codex + manual).
+
+### Fixed
+
+- **Review never runs git helpers.** Diffs use `--no-ext-diff --no-textconv`, so a
+  configured external diff or textconv program cannot run (and write) before
+  grok starts.
+- **Process group torn down on every exit**, not only after an abort: a
+  descendant that closed its pipes no longer outlives a clean run.
+- **Split multibyte characters survive streaming.** stdout/stderr decode
+  statefully instead of per chunk.
+- **Bare `/grok:cancel` targets the newest active job** instead of the newest job
+  overall (which may already be finished).
+- **`grok --version` probe is bounded** so a stalled launcher cannot hang setup.
+
 ## [0.6.0] — 2026-10-16
 
 Grok reviews and consults now finish in 1-4 minutes instead of timing out.

@@ -213,7 +213,9 @@ export function reconcile(workspaceRoot, job) {
   return current;
 }
 
-export function resolveJob(workspaceRoot, reference) {
+// preferActive: with no reference, pick the newest still-active job (what a bare
+// cancel means) and fall back to the newest job overall.
+export function resolveJob(workspaceRoot, reference, { preferActive = false } = {}) {
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
   if (reference) {
     const match = jobs.find((j) => j.id === reference);
@@ -221,5 +223,9 @@ export function resolveJob(workspaceRoot, reference) {
     return reconcile(workspaceRoot, match);
   }
   if (jobs.length === 0) throw new Error("No Grok jobs found for this workspace.");
+  if (preferActive) {
+    const active = jobs.find((j) => ACTIVE_STATUSES.has(j.status));
+    if (active) return reconcile(workspaceRoot, active);
+  }
   return reconcile(workspaceRoot, jobs[0]);
 }

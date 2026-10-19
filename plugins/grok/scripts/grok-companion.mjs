@@ -578,7 +578,7 @@ async function handleCancel(argv) {
     booleanOptions: ["json"],
   });
   const workspaceRoot = resolveWorkspaceRoot(resolveCwd(options));
-  const job = resolveJob(workspaceRoot, positionals[0]);
+  const job = resolveJob(workspaceRoot, positionals[0], { preferActive: true });
   // Record the cancellation first, and only for a job that is still active: a
   // finished job is left alone (cancel with no id picks the newest job, which
   // used to rewrite a completed review as cancelled and hide its output).
