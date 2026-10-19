@@ -217,11 +217,15 @@ function changedFilesSection(cwd, target, paths) {
   const skipped = [];
   const blobs = new Map();
   if (target.mode === "branch") {
-    // <mode> SP <type> SP <object> SP <size> TAB <path>
-    const tree = gitOrThrow(["--literal-pathspecs", "ls-tree", "-z", "-l", "HEAD", "--", ...paths], top);
-    for (const entry of nulList(tree)) {
-      const m = entry.match(/^(\d+) (\w+) (\S+) +(\S+)\t(.*)$/s);
-      if (m) blobs.set(m[5], { mode: m[1], type: m[2], size: Number(m[4]) });
+    // <mode> SP <type> SP <object> SP <size> TAB <path>. Batched so a branch with
+    // thousands of changed paths cannot overflow argv (E2BIG).
+    for (let i = 0; i < paths.length; i += 500) {
+      const batch = paths.slice(i, i + 500);
+      const tree = gitOrThrow(["--literal-pathspecs", "ls-tree", "-z", "-l", "HEAD", "--", ...batch], top);
+      for (const entry of nulList(tree)) {
+        const m = entry.match(/^(\d+) (\w+) (\S+) +(\S+)\t(.*)$/s);
+        if (m) blobs.set(m[5], { mode: m[1], type: m[2], size: Number(m[4]) });
+      }
     }
   }
   for (const f of paths) {

@@ -4,6 +4,14 @@ All notable changes to this plugin are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] — 2026-10-19
+
+### Fixed
+
+- **Branch reviews with thousands of changed files no longer fail with E2BIG.** The
+  `git ls-tree` call that sizes files for inlining is batched (500 paths per call)
+  instead of putting every path on one command line.
+
 ## [0.6.1] — 2026-10-19
 
 Hardening backported from the agy plugin review (Codex + manual).
