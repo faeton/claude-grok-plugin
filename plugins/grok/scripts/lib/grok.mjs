@@ -37,6 +37,10 @@ export const PROMPT_DIR_PREFIX = "grok-companion-prompt-";
 // run's own watchdogs exist, so it needs its own.
 const MODEL_PROBE_TIMEOUT_MS = 10_000;
 
+// The same for the availability probes (`grok --version`, `bwrap --version`):
+// a wedged binary used to hang setup and every run before any watchdog existed.
+const PROBE_TIMEOUT_MS = 10_000;
+
 // Model and reasoning effort, chosen as a named profile. Measured on identical
 // review prompts (2026-10-16, grok CLI 1.0.60, on two machines): grok-4.7 at
 // medium took 4-15 minutes, made 40-72 tool calls and timed out on real branch
@@ -242,7 +246,17 @@ const BWRAP_HINT =
 export function sandboxAvailability() {
   if (process.platform !== "linux") return { available: true, required: true, warning: null };
   const required = process.env.GROK_COMPANION_REQUIRE_SANDBOX === "1";
-  const res = spawnSync("bwrap", ["--version"], { stdio: "ignore" });
+  const res = spawnSync("bwrap", ["--version"], {
+    stdio: "ignore",
+    timeout: PROBE_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+  });
+  // A bwrap that hangs is present but broken, not missing: the run stops
+  // instead of quietly going unsandboxed or waiting out grok's watchdogs.
+  if (res.error?.code === "ETIMEDOUT") {
+    const problem = `\`bwrap --version\` did not answer within ${PROBE_TIMEOUT_MS / 1000}s, so grok's sandbox cannot be trusted to start`;
+    return { available: false, required: true, warning: null, problem };
+  }
   if (required || (!res.error && res.status === 0)) {
     return { available: !res.error && res.status === 0, required: true, warning: null };
   }
@@ -281,11 +295,18 @@ export function readOnlyArgs({ web = true, sandbox = true } = {}) {
 }
 
 export function getGrokAvailability() {
-  const res = spawnSync(GROK_BIN, ["--version"], { encoding: "utf8", timeout: MODEL_PROBE_TIMEOUT_MS });
-  if (res.error || res.status !== 0) {
-    return { available: false, version: null };
+  const res = spawnSync(GROK_BIN, ["--version"], {
+    encoding: "utf8",
+    timeout: PROBE_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+  });
+  if (res.error?.code === "ETIMEDOUT") {
+    return { available: false, version: null, problem: `\`grok --version\` did not answer within ${PROBE_TIMEOUT_MS / 1000}s` };
   }
-  return { available: true, version: res.stdout.trim() };
+  if (res.error || res.status !== 0) {
+    return { available: false, version: null, problem: null };
+  }
+  return { available: true, version: res.stdout.trim(), problem: null };
 }
 
 // Auth heuristic: ~/.grok/auth.json exists and is non-empty.

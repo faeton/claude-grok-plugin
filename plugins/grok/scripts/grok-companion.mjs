@@ -127,13 +127,17 @@ function sleep(ms) {
 // Millisecond flags. A bad value is an error, not a silent default: a negative
 // timeout used to reach setTimeout and kill the run immediately, and `0`
 // quietly became 15 minutes. `allowZero` is for --idle-ms, where 0 is the
-// documented off-switch.
+// documented off-switch. Node timers hold at most 2^31-1 ms (~24.8 days) and
+// turn anything larger into 1 ms, so a huge value would have killed the run at
+// once; it is rejected instead, as are fractions.
+const MAX_TIMER_MS = 2 ** 31 - 1;
 function parseMs(raw, name, fallback, { allowZero = false } = {}) {
   if (raw === undefined || raw === null || raw === "") return fallback;
   const n = Number(raw);
-  if (!Number.isFinite(n) || n < 0 || (n === 0 && !allowZero)) {
+  if (!Number.isInteger(n) || n < 0 || n > MAX_TIMER_MS || (n === 0 && !allowZero)) {
     throw new Error(
-      `--${name} must be a ${allowZero ? "non-negative" : "positive"} number of milliseconds (got "${raw}").`,
+      `--${name} must be a ${allowZero ? "non-negative" : "positive"} whole number of milliseconds ` +
+        `up to ${MAX_TIMER_MS} (got "${raw}").`,
     );
   }
   return n;
@@ -181,7 +185,9 @@ async function handleSetup(argv) {
     nextSteps.push("Run `!grok login` to authenticate.");
   }
   const sandbox = sandboxAvailability();
-  if (!sandbox.available) {
+  if (sandbox.problem) {
+    nextSteps.push(`Fix bubblewrap: ${sandbox.problem}.`);
+  } else if (!sandbox.available) {
     nextSteps.push(
       sandbox.required
         ? "Install bubblewrap (`bwrap`) or put a standalone binary on PATH — GROK_COMPANION_REQUIRE_SANDBOX=1 makes runs fail without it."
@@ -233,6 +239,7 @@ async function runConsult(req, progress) {
   const eff = effortArgs(req);
   if (eff.dropped) progress?.({ message: eff.dropped });
   const sandbox = sandboxAvailability();
+  if (sandbox.problem) throw new Error(sandbox.problem);
   if (sandbox.warning) progress?.({ message: sandbox.warning });
   const args = [
     // streaming-json (not `stream-json`) so a stalled relay is visible as an
@@ -370,6 +377,7 @@ async function runReview(req, kind, progress) {
   const eff = effortArgs(req);
   if (eff.dropped) progress?.({ message: eff.dropped });
   const sandbox = sandboxAvailability();
+  if (sandbox.problem) throw new Error(sandbox.problem);
   if (sandbox.warning) progress?.({ message: sandbox.warning });
   const args = [
     "--output-format",
@@ -614,7 +622,9 @@ async function handleCancel(argv) {
 function ensureGrokReady() {
   const grok = getGrokAvailability();
   if (!grok.available) {
-    throw new Error("grok CLI not found on PATH. Run `/grok:setup` for guidance.");
+    throw new Error(
+      grok.problem ? `${grok.problem}. Run \`/grok:setup\` for guidance.` : "grok CLI not found on PATH. Run `/grok:setup` for guidance.",
+    );
   }
 }
 

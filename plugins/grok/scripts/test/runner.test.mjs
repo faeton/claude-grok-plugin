@@ -323,6 +323,33 @@ console.log("\nmodel");
   delete process.env.GROK_PLUGIN_MODEL;
 }
 
+console.log("\nhung probes");
+{
+  const hang = join(DIR, "hang");
+  mkdirSync(hang, { recursive: true });
+  for (const name of ["grok", "bwrap"]) {
+    writeFileSync(join(hang, name), "#!/bin/sh\nexec sleep 30\n");
+    chmodSync(join(hang, name), 0o755);
+  }
+  const savedPath = process.env.PATH;
+  process.env.GROK_BIN = join(hang, "grok");
+  process.env.PATH = `${hang}:${savedPath}`;
+  const mod = await import(`${LIB}?probe=hang`);
+  const t0 = Date.now();
+  const avail = mod.getGrokAvailability();
+  check("a hung `grok --version` is bounded and named", !avail.available && /did not answer/.test(avail.problem) && Date.now() - t0 < 20_000, avail);
+  if (process.platform === "linux") {
+    delete process.env.GROK_COMPANION_REQUIRE_SANDBOX;
+    const sb = mod.sandboxAvailability();
+    check("a hung bwrap keeps the sandbox required and reports it", sb.required && !sb.available && /did not answer/.test(sb.problem), sb);
+    process.env.GROK_COMPANION_REQUIRE_SANDBOX = "1";
+    const sbReq = mod.sandboxAvailability();
+    check("...also when the sandbox is already required", /did not answer/.test(sbReq.problem ?? ""), sbReq);
+    delete process.env.GROK_COMPANION_REQUIRE_SANDBOX;
+  }
+  process.env.PATH = savedPath;
+}
+
 console.log("\nprofiles");
 {
   const mod = await import(`${LIB}?profile=plain`);

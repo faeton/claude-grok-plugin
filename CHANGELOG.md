@@ -4,6 +4,35 @@ All notable changes to this plugin are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] — 2026-10-21
+
+Hardening of the work the companion does before grok starts, outside grok's
+sandbox. Found in a Codex review of the plugin, then reviewed by grok itself.
+
+### Fixed
+
+- **git calls write nothing and start nothing.** On top of 0.6.1's
+  `--no-ext-diff --no-textconv`, every git call runs with
+  `GIT_OPTIONAL_LOCKS=0` (`git status` no longer rewrites the index),
+  fsmonitor off, no credential prompts and no lazy fetches.
+- **Every git call and probe has a time limit.** git calls get 60 s;
+  `bwrap --version` and the workspace lookup get 10 s, like `grok --version`. A hung
+  probe is reported as hung, not as "not found". A hung `bwrap` stops the run
+  instead of dropping the sandbox, and a hung workspace lookup fails instead of
+  filing the job under the wrong repository.
+- **Working-tree reviews show what is on disk, plus what is staged where the
+  two differ.** Staged and unstaged patches used to be concatenated, so a
+  staged bug already undone on disk looked current. The main diff is now the
+  working tree against HEAD (the empty tree before the first commit). For
+  paths whose staged content differs from disk (`MM`, `AD`, `git rm
+  --cached`), the staged patch follows in its own labeled section.
+- **No symlink-swap or FIFO reads.** Untracked and inlined files are opened
+  with `O_NOFOLLOW | O_NONBLOCK` and checked on the open descriptor, so a path
+  replaced by a symlink after the check is not followed and a FIFO cannot
+  block the review. A `--file` that is not a regular file is refused.
+- **`--timeout-ms` / `--idle-ms` reject values Node timers cannot hold** (over
+  2^31-1 ms, which Node turned into 1 ms) and fractions.
+
 ## [0.6.2] — 2026-10-19
 
 ### Fixed

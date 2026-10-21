@@ -1,7 +1,7 @@
 // Git helpers + review/consult prompt construction.
 
 import { spawnSync } from "node:child_process";
-import { closeSync, existsSync, fstatSync, lstatSync, openSync, readSync, readlinkSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, openSync, readSync, readlinkSync } from "node:fs";
 import { resolve } from "node:path";
 
 const MAX_FILE_BYTES = 200_000;
@@ -40,10 +40,28 @@ const SKIP_INLINE =
 // result instead, with a clear error.
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 
+// These git calls run before grok and outside its sandbox, so they get their
+// own bound and are kept from writing or running repo-configured programs:
+// optional locks off (`git status` otherwise refreshes the index), fsmonitor
+// off (it starts a daemon), no credential prompts or lazy fetches from a
+// partial clone. Diffs also pass --no-ext-diff --no-textconv (see DIFF_SAFE).
+const GIT_TIMEOUT_MS = 60_000;
+const GIT_ENV = { GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0", GIT_NO_LAZY_FETCH: "1" };
+const GIT_CONFIG = ["-c", "core.fsmonitor=false"];
+// diff.external and textconv drivers are arbitrary commands from git config.
+const DIFF_SAFE = ["--no-ext-diff", "--no-textconv"];
+
 // Run git. Returns { ok, status, stdout, stderr, error } so callers can tell
 // "command failed" from "command succeeded with empty output".
 export function git(args, opts = {}) {
-  const res = spawnSync("git", args, { encoding: "utf8", maxBuffer: GIT_MAX_BUFFER, ...opts });
+  const res = spawnSync("git", [...GIT_CONFIG, ...args], {
+    encoding: "utf8",
+    maxBuffer: GIT_MAX_BUFFER,
+    timeout: GIT_TIMEOUT_MS,
+    killSignal: "SIGKILL",
+    ...opts,
+    env: { ...process.env, ...GIT_ENV, ...opts.env },
+  });
   return {
     ok: !res.error && res.status === 0,
     status: res.status,
@@ -60,8 +78,11 @@ function gitOrThrow(args, cwd) {
     const why =
       res.error?.code === "ENOBUFS"
         ? `output exceeded ${GIT_MAX_BUFFER} bytes`
-        : res.stderr.trim().split("\n")[0] || res.error?.message || `exit code ${res.status}`;
-    throw new Error(`\`git ${args[0]}\` failed: ${why}`);
+        : res.error?.code === "ETIMEDOUT"
+          ? `no result after ${GIT_TIMEOUT_MS / 1000}s`
+          : res.stderr.trim().split("\n")[0] || res.error?.message || `exit code ${res.status}`;
+    const command = args.find((a) => !a.startsWith("-")) ?? args[0];
+    throw new Error(`\`git ${command}\` failed: ${why}`);
   }
   return res.stdout;
 }
@@ -146,11 +167,25 @@ function checkDiffSize(diff) {
 }
 
 // Read at most `limit` bytes of a regular file, reporting its full size, without
-// loading a multi-gigabyte artifact into memory first.
-function readHead(abs, limit) {
-  const fd = openSync(abs, "r");
+// loading a multi-gigabyte artifact into memory first. Returns null for anything
+// that is not a regular file once opened. The check is on the open descriptor,
+// not an earlier lstat, so a path swapped for a symlink or a FIFO in between is
+// caught: with follow=false O_NOFOLLOW refuses the link, and O_NONBLOCK keeps a
+// FIFO from blocking the open.
+const O_NOFOLLOW = fsConstants.O_NOFOLLOW ?? 0;
+const O_NONBLOCK = fsConstants.O_NONBLOCK ?? 0;
+function readHead(abs, limit, { follow = false } = {}) {
+  let fd;
   try {
-    const size = fstatSync(fd).size;
+    fd = openSync(abs, fsConstants.O_RDONLY | O_NONBLOCK | (follow ? 0 : O_NOFOLLOW));
+  } catch (err) {
+    if (err.code === "ELOOP" || err.code === "EMLINK") return null; // a symlink under O_NOFOLLOW
+    throw err;
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) return null;
+    const size = st.size;
     const buf = Buffer.alloc(Math.min(size, limit));
     const n = readSync(fd, buf, 0, buf.length, 0);
     return { size, body: buf.subarray(0, n).toString("utf8"), binary: buf.subarray(0, n).includes(0) };
@@ -188,9 +223,11 @@ function describeUntracked(cwd, f, budget) {
   if (st.size > budget.left) {
     return { text: `Untracked file ${f}: (${st.size} bytes, skipped — review size budget used up)`, bytes: 0 };
   }
-  const { body, binary } = readHead(abs, MAX_FILE_BYTES);
-  if (binary) return { text: `Untracked file ${f}: (binary, skipped)`, bytes: 0 };
-  return { text: [`Untracked file ${f}:`, "```", body, "```"].join("\n"), bytes: st.size };
+  // Read at most what the lstat sizes allowed, in case the file grew since.
+  const file = readHead(abs, Math.min(st.size, budget.left));
+  if (!file) return null; // replaced by a link or special file since the lstat
+  if (file.binary) return { text: `Untracked file ${f}: (binary, skipped)`, bytes: 0 };
+  return { text: [`Untracked file ${f}:`, "```", file.body, "```"].join("\n"), bytes: Buffer.byteLength(file.body) };
 }
 
 // A code fence longer than any backtick run in the body, so a file that itself
@@ -212,7 +249,7 @@ function nulList(out) {
 function changedFilesSection(cwd, target, paths) {
   let left = inlineBudget();
   if (!left || !paths.length) return null;
-  const top = gitOrThrow(["rev-parse", "--show-toplevel"], cwd).trim();
+  const top = topLevel(cwd);
   const shown = [];
   const skipped = [];
   const blobs = new Map();
@@ -250,14 +287,14 @@ function changedFilesSection(cwd, target, paths) {
       }
       if (!st.isFile()) continue;
       size = st.size;
-      read = () => readHead(abs, size).body;
+      read = () => readHead(abs, size)?.body ?? null;
     }
     if (size > left) {
       skipped.push(`${f} (${size} bytes, over the inline budget)`);
       continue;
     }
     const body = read();
-    if (body.includes("\0")) continue;
+    if (body === null || body.includes("\0")) continue;
     left -= size;
     const fc = fence(body);
     shown.push("", `--- ${f} ---`, fc, body.replace(/\n$/, ""), fc);
@@ -278,11 +315,24 @@ function changedFilesSection(cwd, target, paths) {
   return out.join("\n");
 }
 
+function topLevel(cwd) {
+  return gitOrThrow(["rev-parse", "--show-toplevel"], cwd).trim();
+}
+
+// HEAD, or the empty tree in a repository with no commits yet. The empty
+// tree's id depends on the object format, so it is asked of git.
+function worktreeBase(cwd) {
+  if (git(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], { cwd }).ok) return "HEAD";
+  const res = git(["hash-object", "-t", "tree", "--stdin"], { cwd, input: "" });
+  if (!res.ok) throw new Error("`git hash-object` failed: could not name the empty tree");
+  return res.stdout.trim();
+}
+
 // Collect the diff/context text for a target. Returns { content, empty }.
 export function collectReviewContext(cwd, target) {
   if (target.mode === "branch") {
     const base = target.baseRef;
-    const diff = gitOrThrow(["diff", "--no-ext-diff", "--no-textconv", "--end-of-options", `${base}...HEAD`], cwd);
+    const diff = gitOrThrow(["diff", ...DIFF_SAFE, "--end-of-options", `${base}...HEAD`], cwd);
     checkDiffSize(diff);
     const log = gitOrThrow(["log", "--oneline", "--end-of-options", `${base}..HEAD`], cwd);
     const sections = [`Comparing against base: ${base} (\`git diff ${base}...HEAD\`)`];
@@ -299,23 +349,43 @@ export function collectReviewContext(cwd, target) {
   }
 
   // working tree
-  const sections = ["Reviewing the working tree (staged + unstaged + untracked)."];
+  const sections = [
+    "Reviewing the working tree: the files on disk as one diff against HEAD, plus untracked files.",
+  ];
   const status = gitOrThrow(["status", "--short", "--untracked-files=all"], cwd);
   if (status.trim()) {
     sections.push("", "git status:", "```", status.trim(), "```");
   }
-  const staged = gitOrThrow(["diff", "--no-ext-diff", "--no-textconv", "--cached"], cwd);
-  const unstaged = gitOrThrow(["diff", "--no-ext-diff", "--no-textconv"], cwd);
-  const diff = [staged, unstaged].filter((s) => s.trim()).join("\n");
-  checkDiffSize(diff);
+  // One net diff of the working tree against HEAD. Concatenating the staged
+  // and unstaged patches showed a staged bug already undone on disk as if it
+  // were still there. With no commit yet the base is the empty tree.
+  const from = worktreeBase(cwd);
+  const diff = gitOrThrow(["diff", ...DIFF_SAFE, from], cwd);
+  // The net diff alone hides what only the index holds: a staged file deleted
+  // on disk (AD), a staged edit with a different edit on top (MM), or
+  // `git rm --cached` (the file then looks untracked). For paths whose staged
+  // content differs from disk, the staged patch is shown as well, since that
+  // is what `git commit` records.
+  const untrackedList = nulList(gitOrThrow(["ls-files", "-z", "--others", "--exclude-standard"], cwd));
+  const stagedPaths = nulList(gitOrThrow(["diff", "--cached", "--name-only", "-z"], cwd));
+  // `diff --name-only` paths are relative to the top level, so the untracked
+  // list is asked for in that form too (--full-name).
+  const onDisk = new Set([
+    ...nulList(gitOrThrow(["diff", "--name-only", "-z"], cwd)),
+    ...nulList(gitOrThrow(["ls-files", "-z", "--others", "--exclude-standard", "--full-name"], cwd)),
+  ]);
+  const divergent = stagedPaths.filter((f) => onDisk.has(f));
+  const stagedDiff = divergent.length
+    ? gitOrThrow(["--literal-pathspecs", "diff", ...DIFF_SAFE, "--cached", "--", ...divergent], topLevel(cwd))
+    : "";
+  checkDiffSize(diff + stagedDiff);
 
   // -z: NUL-separated and unquoted. Without it git C-quotes names containing
   // spaces, tabs, newlines or non-ASCII bytes, and those quoted strings are not
   // real paths — such files silently vanished from the review.
   let hasUntracked = false;
   const budget = { left: MAX_UNTRACKED_BYTES };
-  const untracked = gitOrThrow(["ls-files", "-z", "--others", "--exclude-standard"], cwd);
-  for (const f of untracked.split("\0").filter(Boolean)) {
+  for (const f of untrackedList) {
     const section = describeUntracked(cwd, f, budget);
     if (!section) continue;
     hasUntracked = true;
@@ -324,13 +394,20 @@ export function collectReviewContext(cwd, target) {
   }
 
   sections.push("", "Diff:", "```diff", diff.trim() || "(no tracked diff)", "```");
-  const changed = new Set([
-    ...nulList(gitOrThrow(["diff", "--cached", "--name-only", "-z", "--diff-filter=d"], cwd)),
-    ...nulList(gitOrThrow(["diff", "--name-only", "-z", "--diff-filter=d"], cwd)),
-  ]);
-  const full = changedFilesSection(cwd, target, [...changed]);
+  if (stagedDiff.trim()) {
+    sections.push(
+      "",
+      "Staged and on-disk versions differ for some paths (see git status). The staged version, " +
+        "which is what `git commit` would record (`git diff --cached`):",
+      "```diff",
+      stagedDiff.trim(),
+      "```",
+    );
+  }
+  const changed = nulList(gitOrThrow(["diff", "--name-only", "-z", "--diff-filter=d", from], cwd));
+  const full = changedFilesSection(cwd, target, changed);
   if (full) sections.push("", full);
-  return { content: sections.join("\n"), empty: !diff.trim() && !hasUntracked };
+  return { content: sections.join("\n"), empty: !diff.trim() && !hasUntracked && !stagedDiff.trim() };
 }
 
 const REVIEW_HEADER = [
@@ -388,8 +465,10 @@ export function buildConsultPrompt({ question, files = [], cwd = process.cwd() }
       throw new Error(`file not found: ${f}`);
     }
     // An explicit --file is the user's choice, so symlinks are followed here,
-    // but only the first MAX_FILE_BYTES are ever read.
-    const { size, body } = readHead(abs, MAX_FILE_BYTES);
+    // but only the first MAX_FILE_BYTES of a regular file are ever read.
+    const file = readHead(abs, MAX_FILE_BYTES, { follow: true });
+    if (!file) throw new Error(`not a regular file: ${f}`);
+    const { size, body } = file;
     const clipped =
       size > MAX_FILE_BYTES ? body + `\n… (truncated, ${size} bytes total)` : body;
     parts.push("", `--- ${f} ---`, "```", clipped, "```");

@@ -106,7 +106,7 @@ export function renderCancel(job, { cancelled = true } = {}) {
 
 export function renderSetup(report) {
   const lines = ["Grok companion setup:"];
-  lines.push(`  grok CLI: ${report.grok.available ? `✓ ${report.grok.version}` : "✗ not found"}`);
+  lines.push(`  grok CLI: ${report.grok.available ? `✓ ${report.grok.version}` : `✗ ${report.grok.problem || "not found"}`}`);
   lines.push(`  auth:     ${report.auth.loggedIn ? "✓ logged in" : "✗ not logged in"}`);
   if (report.sandbox) {
     lines.push(

@@ -8,7 +8,7 @@
 //   node plugins/grok/scripts/test/state.test.mjs
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,7 +19,7 @@ delete process.env.GROK_COMPANION_SESSION_ID;
 
 const LIB = resolve(dirname(fileURLToPath(import.meta.url)), "..", "lib");
 const { parseArgs } = await import(join(LIB, "args.mjs"));
-const { collectReviewContext, resolveReviewTarget } = await import(join(LIB, "git.mjs"));
+const { buildConsultPrompt, collectReviewContext, resolveReviewTarget } = await import(join(LIB, "git.mjs"));
 const { createJob, reconcile, runTrackedJob, transition, START_GRACE_MS } = await import(
   join(LIB, "jobs.mjs")
 );
@@ -149,6 +149,65 @@ process.env.GROK_PLUGIN_INLINE_BYTES = "0";
 ctx = collectReviewContext(full, { mode: "branch", baseRef: "main" });
 check("GROK_PLUGIN_INLINE_BYTES=0 turns inlining off", !ctx.content.includes("Full current text"), null);
 delete process.env.GROK_PLUGIN_INLINE_BYTES;
+
+// Working tree as one net diff against HEAD.
+const net = makeRepo("net");
+writeFileSync(join(net, "a.txt"), "STAGED-BUG\n");
+g(net, "add", "a.txt");
+writeFileSync(join(net, "a.txt"), "fixed\n");
+ctx = collectReviewContext(net, { mode: "working-tree" });
+const mainDiff = ctx.content.split("Staged and on-disk versions differ")[0];
+check("a staged change undone on disk is not in the main diff", !mainDiff.includes("STAGED-BUG") && mainDiff.includes("+fixed"), ctx.content);
+check("...and appears only as the labeled staged version", ctx.content.includes("+STAGED-BUG") && /what `git commit` would record/.test(ctx.content), null);
+
+// Index-only changes are shown too, as the staged version.
+const idx = makeRepo("index");
+writeFileSync(join(idx, "added.txt"), "ADDED-THEN-DELETED\n");
+g(idx, "add", "added.txt");
+spawnSync("rm", [join(idx, "added.txt")]);
+ctx = collectReviewContext(idx, { mode: "working-tree" });
+check("a staged file deleted on disk (AD) is reviewed", !ctx.empty && ctx.content.includes("+ADDED-THEN-DELETED"), ctx.content);
+const mm = makeRepo("mm");
+writeFileSync(join(mm, "a.txt"), "STAGED-VERSION\n");
+g(mm, "add", "a.txt");
+writeFileSync(join(mm, "a.txt"), "DISK-VERSION\n");
+ctx = collectReviewContext(mm, { mode: "working-tree" });
+check("MM: both the on-disk and the staged version are shown", ctx.content.includes("+DISK-VERSION") && ctx.content.includes("+STAGED-VERSION") && /what `git commit` would record/.test(ctx.content), ctx.content);
+const rmc = makeRepo("rmcached");
+g(rmc, "rm", "-q", "--cached", "a.txt");
+ctx = collectReviewContext(rmc, { mode: "working-tree" });
+check("git rm --cached shows the staged deletion", /deleted file mode[\s\S]*-one/.test(ctx.content), ctx.content);
+
+const unborn = join(DIR, "unborn");
+mkdirSync(unborn);
+g(unborn, "init", "-q", "-b", "main");
+writeFileSync(join(unborn, "first.txt"), "first file\n");
+g(unborn, "add", "first.txt");
+ctx = collectReviewContext(unborn, { mode: "working-tree" });
+check("a repo with no commits yet diffs against the empty tree", !ctx.empty && ctx.content.includes("+first file"), ctx.content);
+
+// Repo-configured programs must not run during context collection.
+const hostile = makeRepo("hostile");
+const marker = join(DIR, "ran-a-program");
+const prog = join(DIR, "prog.sh");
+writeFileSync(prog, `#!/bin/sh\ntouch "${marker}"\ncat "$1" 2>/dev/null\n`);
+chmodSync(prog, 0o755);
+g(hostile, "config", "diff.external", prog);
+g(hostile, "config", "diff.conv.textconv", prog);
+writeFileSync(join(hostile, ".gitattributes"), "*.txt diff=conv\n");
+writeFileSync(join(hostile, "a.txt"), "two\n");
+ctx = collectReviewContext(hostile, { mode: "working-tree" });
+check("diff.external and textconv drivers are not run", !existsSync(marker) && ctx.content.includes("+two"), ctx.content);
+
+// A FIFO must neither hang the review nor be read.
+const fifoRepo = makeRepo("fifo");
+const fifo = join(fifoRepo, "pipe");
+const mk = spawnSync("mkfifo", [fifo]);
+if (mk.status === 0) {
+  ctx = collectReviewContext(fifoRepo, { mode: "working-tree" });
+  check("an untracked FIFO is skipped without blocking", !ctx.content.includes("Untracked file pipe"), null);
+  check("a --file FIFO is refused, not read", throws(() => buildConsultPrompt({ question: "q", files: [fifo], cwd: fifoRepo }), /not a regular file/), null);
+}
 
 const big = makeRepo("big");
 writeFileSync(join(big, "a.txt"), "x".repeat(2_500_000) + "\n");

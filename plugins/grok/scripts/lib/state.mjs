@@ -24,6 +24,7 @@ import {
 import { resolve, join } from "node:path";
 import { homedir } from "node:os";
 import { createHash } from "node:crypto";
+import { git } from "./git.mjs";
 import { spawnSync } from "node:child_process";
 
 export const ROOT = process.env.GROK_COMPANION_HOME
@@ -33,13 +34,13 @@ export const ROOT = process.env.GROK_COMPANION_HOME
 // Resolve the workspace root for a directory: the git toplevel if inside a repo,
 // otherwise the directory itself.
 export function resolveWorkspaceRoot(cwd = process.cwd()) {
-  const res = spawnSync("git", ["rev-parse", "--show-toplevel"], {
-    cwd,
-    encoding: "utf8",
-  });
-  if (res.status === 0 && res.stdout.trim()) {
+  const res = git(["rev-parse", "--show-toplevel"], { cwd, timeout: 10_000 });
+  if (res.ok && res.stdout.trim()) {
     return res.stdout.trim();
   }
+  // A git that hung is not "not a repository": falling back to cwd would key
+  // this repo's jobs under a different registry.
+  if (res.error?.code === "ETIMEDOUT") throw new Error("`git rev-parse` did not answer within 10s");
   return resolve(cwd);
 }
 
