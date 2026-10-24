@@ -42,7 +42,10 @@ This plugin fixes all three:
   sandbox can't be applied, Grok would carry on unsandboxed, so the companion
   stops the run instead. On Linux the sandbox also needs bubblewrap (`bwrap`)
   on PATH. Without it, runs go ahead without the OS sandbox and show a
-  warning (the tool and permission layers still apply). Set
+  warning (the tool and permission layers still apply). The same fallback
+  covers macOS when grok cannot resolve a container-runtime socket it must deny
+  — e.g. OrbStack's `/var/run/docker.sock` symlink: grok refuses before any tool
+  call, and the companion retries once without `--sandbox`. Set
   `GROK_COMPANION_REQUIRE_SANDBOX=1` to fail instead. Memory is disabled, and reviews also disable web access.
 
   The tool lists use two different vocabularies and both matter: `--tools` /
@@ -276,7 +279,8 @@ Each `grok` call is constructed with:
 [--deny WebFetch --deny WebSearch --disable-web-search]     # reviews only
 --permission-mode dontAsk                                   # refuse, never prompt or auto-run
 --sandbox read-only                                         # OS-enforced; fatal if not applied
-                                                            # (omitted, with a warning, on Linux without bwrap)
+                                                            # (omitted, with a warning, on Linux without bwrap
+                                                            #  or on a socket-deny failure — see above)
 --no-subagents --no-memory                                  # no side channels
 --output-format streaming-json                              # parseable + liveness signal
 ```

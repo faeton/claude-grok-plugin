@@ -46,7 +46,7 @@ import {
   readOnlyArgs,
   resolveModel,
   resolveProfile,
-  runGrok,
+  runGrokReadOnly,
   sandboxAvailability,
   terminateActiveGrok,
   terminateGroups,
@@ -241,19 +241,21 @@ async function runConsult(req, progress) {
   const sandbox = sandboxAvailability();
   if (sandbox.problem) throw new Error(sandbox.problem);
   if (sandbox.warning) progress?.({ message: sandbox.warning });
-  const args = [
+  const model = resolveModel(req.model, req.profile);
+  const buildArgs = (useSandbox) => [
     // streaming-json (not `stream-json`) so a stalled relay is visible as an
     // absence of events rather than an 8-minute silence.
     "--output-format",
     "streaming-json",
-    ...readOnlyArgs({ web: true, sandbox: sandbox.available || sandbox.required }),
+    ...readOnlyArgs({ web: true, sandbox: useSandbox }),
     ...eff.args,
+    ...(model ? ["--model", model] : []),
   ];
-  const model = resolveModel(req.model, req.profile);
-  if (model) args.push("--model", model);
 
   progress?.({ phase: "asking", message: "Sending question to grok…" });
-  const result = await runGrok(args, {
+  const result = await runGrokReadOnly(buildArgs, {
+    sandbox: sandbox.available || sandbox.required,
+    onFallback: (message) => progress?.({ message }),
     prompt,
     cwd: req.cwd,
     timeoutMs: req.timeoutMs,
@@ -379,17 +381,19 @@ async function runReview(req, kind, progress) {
   const sandbox = sandboxAvailability();
   if (sandbox.problem) throw new Error(sandbox.problem);
   if (sandbox.warning) progress?.({ message: sandbox.warning });
-  const args = [
+  const model = resolveModel(req.model, req.profile);
+  const buildArgs = (useSandbox) => [
     "--output-format",
     "streaming-json",
-    ...readOnlyArgs({ web: false, sandbox: sandbox.available || sandbox.required }),
+    ...readOnlyArgs({ web: false, sandbox: useSandbox }),
     ...eff.args,
+    ...(model ? ["--model", model] : []),
   ];
-  const model = resolveModel(req.model, req.profile);
-  if (model) args.push("--model", model);
 
   progress?.({ phase: "reviewing", message: `Reviewing ${target.label}…` });
-  const result = await runGrok(args, {
+  const result = await runGrokReadOnly(buildArgs, {
+    sandbox: sandbox.available || sandbox.required,
+    onFallback: (message) => progress?.({ message }),
     prompt,
     cwd: req.cwd,
     timeoutMs: req.timeoutMs,

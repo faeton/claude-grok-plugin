@@ -4,6 +4,19 @@ All notable changes to this plugin are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.4] — 2026-10-24
+
+### Fixed
+
+- **Consult and review work again on macOS with OrbStack.** grok 1.0.70 refuses
+  the `read-only` profile when a container-runtime socket it must deny is a
+  symlink outside its deny list (`socket deny resolution failed … /var/run/docker.sock`),
+  which OrbStack installs. grok fails before any tool call, so the companion now
+  retries once without `--sandbox` and shows a warning — the same trade-off as
+  Linux without `bwrap`: tool and permission layers still apply, hooks and MCP
+  servers are not OS-confined. `GROK_COMPANION_REQUIRE_SANDBOX=1` keeps it fatal.
+  Every other sandbox failure still stops the run.
+
 ## [0.6.3] — 2026-10-21
 
 Hardening of the work the companion does before grok starts, outside grok's

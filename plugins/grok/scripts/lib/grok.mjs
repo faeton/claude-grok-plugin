@@ -233,8 +233,16 @@ const DENIED_CAPABILITIES = ["Write", "Edit", "Bash", "MCPTool"];
 //    1-4 still keep grok's own tools read-only, but hooks and stdio MCP servers
 //    it spawns are no longer OS-confined. GROK_COMPANION_REQUIRE_SANDBOX=1 keeps
 //    the sandbox mandatory instead.
+//
+//    On macOS grok 1.0.70+ also fails the profile when a container-runtime socket
+//    it must deny (e.g. /var/run/docker.sock) is a symlink to a path outside its
+//    deny list — OrbStack installs exactly that. grok refuses before any tool
+//    call, so runGrokReadOnly retries once without --sandbox and says so, same
+//    trade-off as the Linux no-bwrap case. GROK_COMPANION_REQUIRE_SANDBOX=1
+//    keeps the failure fatal.
 export const SANDBOX_PROFILE = "read-only";
 const SANDBOX_FAILED = /sandbox could not be applied/i;
+const SOCKET_DENY_FAILED = /socket deny resolution failed/i;
 const SANDBOX_REFUSED = /bwrap|bubblewrap|could not enforce its deny list/i;
 const BWRAP_HINT =
   "On Linux grok needs bubblewrap (`bwrap`) for its read-only sandbox. Install it, " +
@@ -816,6 +824,29 @@ export function runGrok(args, options = {}) {
       });
     });
   });
+}
+
+// runGrok under the read-only sandbox, falling back to an unsandboxed run only
+// for the socket-deny failure above. `buildArgs(sandbox)` returns the argv for
+// either attempt; `sandbox: false` skips the sandboxed attempt entirely.
+export async function runGrokReadOnly(buildArgs, { sandbox = true, onFallback, ...options } = {}) {
+  const result = await runGrok(buildArgs(sandbox), options);
+  if (
+    !sandbox ||
+    !result.sandboxFailed ||
+    !SOCKET_DENY_FAILED.test(result.stderr || "") ||
+    process.env.GROK_COMPANION_REQUIRE_SANDBOX === "1"
+  ) {
+    return result;
+  }
+  const warning =
+    `Ran without grok's OS read-only sandbox: ${firstStderrLine(result.stderr).replace(/^warning:\s*/i, "")}. ` +
+    "grok's tools are still limited to read-only ones, but its hooks and MCP servers " +
+    "are not OS-confined. Set GROK_COMPANION_REQUIRE_SANDBOX=1 to fail instead.";
+  onFallback?.(warning);
+  const retry = await runGrok(buildArgs(false), options);
+  retry.warning = [warning, retry.warning].filter(Boolean).join(" ");
+  return retry;
 }
 
 // The wall-clock deadline fired. Say what grok was doing: the old "no response

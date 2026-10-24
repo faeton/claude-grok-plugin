@@ -230,6 +230,59 @@ r = await runFake(
 check("bwrap refusal fails the run", r.ok === false && r.sandboxFailed === true, r);
 check("bwrap refusal explains the fix", /bubblewrap/.test(r.errorMessage || "") && /PATH/.test(r.errorMessage || ""), r.errorMessage);
 
+// Fails the profile the way grok 1.0.70 does under OrbStack's docker.sock symlink,
+// and answers only when run without --sandbox.
+const SOCKET_DENY_BODY =
+  `#!/bin/sh\ncase " $* " in *" --sandbox "*)\n` +
+  `  echo "warning: sandbox could not be applied: socket deny resolution failed: could not resolve runtime-socket deny path /var/run/docker.sock: endpoint is a symlink to a path outside the deny list" >&2\n` +
+  `  echo "error: could not apply the 'read-only' sandbox profile; see the warning above for the cause. Refusing to start with its protections missing." >&2\n` +
+  `  exit 1;;\nesac\n` +
+  `printf '{"type":"text","data":"ran unsandboxed"}\\n'\n` +
+  `printf '{"type":"end","stopReason":"end_turn"}\\n'\n`;
+async function runReadOnlyFake(name, body = SOCKET_DENY_BODY) {
+  const path = join(DIR, `${name}.sh`);
+  writeFileSync(path, body);
+  chmodSync(path, 0o755);
+  process.env.GROK_BIN = path;
+  const mod = await import(`${LIB}?case=${name}`);
+  const fallbacks = [];
+  const result = await mod.runGrokReadOnly(
+    (sandbox) => mod.readOnlyArgs({ web: false, sandbox }),
+    { timeoutMs: 20_000, idleMs: 0, onFallback: (m) => fallbacks.push(m) },
+  );
+  return { result, fallbacks };
+}
+
+let ro = await runReadOnlyFake("socketdeny");
+check("socket-deny failure retries unsandboxed", ro.result.ok && ro.result.text === "ran unsandboxed", ro.result);
+check(
+  "socket-deny fallback warns once",
+  ro.fallbacks.length === 1 &&
+    /without grok's OS read-only sandbox/.test(ro.result.warning || "") &&
+    /docker\.sock/.test(ro.result.warning || ""),
+  ro,
+);
+
+process.env.GROK_COMPANION_REQUIRE_SANDBOX = "1";
+ro = await runReadOnlyFake("socketdeny-required");
+delete process.env.GROK_COMPANION_REQUIRE_SANDBOX;
+check(
+  "socket-deny stays fatal when the sandbox is required",
+  ro.result.ok === false && ro.result.sandboxFailed === true && ro.fallbacks.length === 0,
+  ro,
+);
+
+ro = await runReadOnlyFake(
+  "nosandbox-ro",
+  `#!/bin/sh\necho "warning: sandbox could not be applied: unsupported kernel" >&2\n` +
+    `printf '{"type":"text","data":"ran unsandboxed"}\\n'\nsleep 30\n`,
+);
+check(
+  "other sandbox failures never fall back",
+  ro.result.ok === false && ro.result.sandboxFailed === true && ro.fallbacks.length === 0,
+  ro,
+);
+
 const { readOnlyArgs, sandboxAvailability } = await import(LIB);
 check("unsandboxed fallback omits --sandbox", !readOnlyArgs({ web: false, sandbox: false }).includes("--sandbox"));
 check(
